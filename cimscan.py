@@ -30,6 +30,7 @@ from __future__ import print_function
 
 import argparse
 import json
+import ntpath
 import os
 import sys
 import zipfile
@@ -57,6 +58,11 @@ REDACTION = "***REDACTED***"
 # ticket is as usable as a password until it expires.
 SECRET_KEY_MARKERS = ("PASSWORD", "TOKEN", "SECRET", "APIKEY", "API_KEY",
                       "CREDENTIAL")
+
+# The part name given to a document that holds its layer at the root instead of
+# in a definitions array. Any name that no CIMPATH can spell would do; this one
+# is readable when it reaches a report.
+DOCUMENT_ROOT = "(document)"
 
 # Depth cap on layer nesting. Parts already referenced are tracked and skipped,
 # but an inline child object has no part name to track, so the cap stays.
@@ -294,19 +300,46 @@ def workspace_path(workspace):
     return props.get("DATABASE") or None
 
 
+def is_windows_absolute(path):
+    r"""True for a drive-letter or UNC path, whatever host is reading it.
+
+    os.path.isabs answers for the HOST, not for the path. On Linux it calls
+    "C:\gis\parcels.gdb" relative and joins it onto the project home, inventing
+    a path that was never in the document. That matters here because scanning a
+    shared drive full of Windows-authored projects FROM a Linux file server is
+    the case this tool exists for.
+    """
+    if not path:
+        return False
+    if path[:2] in ("//", chr(92) * 2):
+        return True
+    return len(path) > 2 and path[1] == ":" and path[2] in ("/", chr(92))
+
+
 def resolve(path, home):
-    """Resolve a workspace path against the project home directory.
+    r"""Resolve a workspace path against the project home directory.
 
     Pro saves relative paths by default, so a workspace of
-    "DATABASE=..\\commondata\\parcels.gdb" is normal and means nothing until you
+    "DATABASE=..\commondata\parcels.gdb" is normal and means nothing until you
     know which document it came out of.
+
+    A Windows-absolute path is returned in Windows form on every host. It names
+    a location on a Windows machine, and rewriting its separators to suit the
+    reader would report a path that appears in no document.
     """
     if not path:
         return None
-    native = path.replace("\\", os.sep).replace("/", os.sep)
-    if os.path.isabs(native) or native[1:2] == ":":
+    # A drive prefix, with or without a separator after it. "C:parcels.gdb" is
+    # drive-RELATIVE: it means parcels.gdb in whatever the current directory on
+    # C: happens to be. Joining that onto the project home would assert a
+    # location Windows itself does not promise, so it is left as written.
+    if is_windows_absolute(path) or path[1:2] == ":":
+        return ntpath.normpath(path)
+    native = path.replace(chr(92), os.sep).replace("/", os.sep)
+    if os.path.isabs(native):
         return os.path.normpath(native)
     return os.path.normpath(os.path.join(home, native))
+
 
 
 def is_network_path(path):
@@ -399,17 +432,33 @@ def document_parts(root):
     them by uri, which is the same indirection the zip performs with CIMPATH.
     Both reduce to a name-to-node table plus a list of entry points, so one
     walker handles both.
+
+    A .mapx names its map "mapDefinition" and a .pagx names its layout
+    "layoutDefinition", both singular, and both keep their standalone tables in
+    standaloneTableDefinitions. Indexing only the plural arrays left the map out
+    of the part table, so every layer in a .mapx lost the map it belongs to and
+    every standalone table it referenced was dropped from the report without a
+    note. A source nobody printed is the failure this tool exists to prevent.
     """
     if not isinstance(root, dict):
         return ({}, [])
     parts = {}
-    for key in ("layerdefinitions", "mapdefinitions"):
+    for key in ("layerdefinitions", "mapdefinitions",
+                "standalonetabledefinitions"):
         for index, definition in enumerate(as_list(root.get(key))):
             if isinstance(definition, dict):
                 name = definition.get("uri") or "%s#%d" % (key, index)
                 parts[name] = definition
+    for key in ("mapdefinition", "layoutdefinition"):
+        definition = root.get(key)
+        if isinstance(definition, dict):
+            parts[definition.get("uri") or key] = definition
     if not parts:
-        return ({"": root}, [""])
+        # The sentinel is named, not empty. part_key refuses an empty reference,
+        # because a layer with no uri must not match a part, so an empty
+        # sentinel resolved to nothing and a document holding its layer at the
+        # root reported no sources at all.
+        return ({DOCUMENT_ROOT: root}, [DOCUMENT_ROOT])
     roots = [r for r in as_list(root.get("layers")) if isinstance(r, str)]
     return (parts, roots or sorted(parts))
 
@@ -637,7 +686,14 @@ def scan_document(path, check_network=False, exists=os.path.exists):
 
     if len(parsed) == 1 and not list(parsed)[0].lower().endswith(".xml"):
         # A single JSON document carries its own part table inside itself.
-        parts, roots = document_parts(list(parsed.values())[0])
+        root = list(parsed.values())[0]
+        # Valid JSON is not the same thing as a CIM document. A settings file
+        # renamed .lyrx parses, holds no layers, and used to be reported OK with
+        # no sources, which reads exactly like a project with nothing broken.
+        if not isinstance(root, dict) or not str(
+                root.get("type", "")).startswith("CIM"):
+            notes.append("the root object is not a CIM document")
+        parts, roots = document_parts(root)
     else:
         parts, roots = parsed, sorted(parsed)
 
@@ -761,6 +817,18 @@ FIXTURE_SDE = ("SERVER=gisdb01;INSTANCE=sde:sqlserver:gisdb01;DATABASE=sdeprod;"
 
 FIXTURE_GDB = "DATABASE=..\\commondata\\parcels.gdb"
 
+# The property set Pro writes into a document for a saved .sde connection that
+# stores its credential: the whole set, in the order Pro emits it, with both
+# password blobs. The short FIXTURE_SDE above is the readable one; this is the
+# shape the redaction actually meets on a shared drive.
+FIXTURE_SDE_REAL = (
+    "ENCRYPTED_PASSWORD=00022e6844ca3f1ab7d59c0e18a5;"
+    "ENCRYPTED_PASSWORD_UTF8=00022e68e1f40c7b25d3;"
+    "SERVER=gisdb01;INSTANCE=sde:sqlserver:gisdb01\\SQLEXPRESS;"
+    "DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=gisdb01\\SQLEXPRESS;"
+    "DATABASE=sdeprod;USER=gis_viewer;AUTHENTICATION_MODE=DBMS;"
+    "BRANCH=sde.DEFAULT;VERSION=sde.DEFAULT")
+
 
 def _fixture_layer_xml(name, dataset, workspace):
     return (
@@ -865,6 +933,93 @@ def _fixture_lyrx(dataset, query, field, name="ACLED"):
     })
 
 
+def _fixture_mapx():
+    """A .mapx: CIM JSON whose map is one object, not an array.
+
+    Written the way the CIM serialiser writes it, including the "uRI" spelling a
+    real .lyrx on this machine uses, and a standalone table the map holds by
+    reference. Both are what a .mapx has and a .lyrx does not.
+    """
+    return json.dumps({
+        "type": "CIMMapDocument",
+        "version": "3.5.0",
+        "mapDefinition": {
+            "type": "CIMMap",
+            "name": "Zoning Review",
+            "uRI": "CIMPATH=map/map.xml",
+            "layers": ["CIMPATH=map/parcels.json"],
+            "standaloneTables": ["CIMPATH=map/owners.json"],
+        },
+        "layerDefinitions": [{
+            "type": "CIMFeatureLayer",
+            "name": "Parcels",
+            "uRI": "CIMPATH=map/parcels.json",
+            "featureTable": {
+                "type": "CIMFeatureTable",
+                "dataConnection": {
+                    "type": "CIMStandardDataConnection",
+                    "workspaceConnectionString": FIXTURE_GDB,
+                    "workspaceFactory": "FileGDB",
+                    "dataset": "Parcels",
+                    "datasetType": "esriDTFeatureClass",
+                },
+            },
+        }],
+        "standaloneTableDefinitions": [{
+            "type": "CIMStandaloneTable",
+            "name": "Owner Lookup",
+            "uRI": "CIMPATH=map/owners.json",
+            "dataConnection": {
+                "type": "CIMStandardDataConnection",
+                "workspaceConnectionString": FIXTURE_SDE_REAL,
+                "dataset": "GIS.Owners",
+                "datasetType": "esriDTTable",
+            },
+        }],
+        "binaryReferences": [],
+    })
+
+
+def _fixture_pagx():
+    """A .pagx: a layout document, whose maps are an array beside the layout."""
+    return json.dumps({
+        "type": "CIMLayoutDocument",
+        "version": "3.5.0",
+        "layoutDefinition": {
+            "type": "CIMLayout",
+            "name": "Zoning Board",
+            "uRI": "CIMPATH=layout/layout.xml",
+            "elements": [{
+                "type": "CIMMapFrame",
+                "name": "Map Frame",
+                "view": {"type": "CIMMapView",
+                         "map": {"uRI": "CIMPATH=map/map.xml"}},
+            }],
+        },
+        "mapDefinitions": [{
+            "type": "CIMMap",
+            "name": "Inset",
+            "uRI": "CIMPATH=map/map.xml",
+            "layers": ["CIMPATH=map/roads.json"],
+        }],
+        "layerDefinitions": [{
+            "type": "CIMFeatureLayer",
+            "name": "Roads",
+            "uRI": "CIMPATH=map/roads.json",
+            "featureTable": {
+                "type": "CIMFeatureTable",
+                "dataConnection": {
+                    "type": "CIMStandardDataConnection",
+                    "workspaceConnectionString": FIXTURE_SDE_REAL,
+                    "dataset": "GIS.Roads",
+                    "datasetType": "esriDTFeatureClass",
+                },
+            },
+        }],
+        "binaryReferences": [],
+    })
+
+
 def self_test():
     """Assertions over the parser and the decision core. No arcpy, no network."""
     import io
@@ -891,6 +1046,17 @@ def self_test():
             check(False, "%s (wrong exception %r)" % (label, exc))
         else:
             check(False, "%s (no error raised)" % label)
+
+    def run(argv):
+        """main() with both streams captured, returning (exit code, output)."""
+        buffer = io.StringIO()
+        saved = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = buffer, buffer
+        try:
+            code = main(argv)
+        finally:
+            sys.stdout, sys.stderr = saved
+        return code, buffer.getvalue()
 
     print("cimscan self-test: no arcpy, no licence, no network")
     print("-" * 68)
@@ -932,6 +1098,26 @@ def self_test():
         check(redact("SERVER=a;INSTANCE=b") == "SERVER=a;INSTANCE=b",
               "a connection with no secret is returned byte for byte")
 
+        # ---- a whole .sde property set, the shape Pro really saves
+        real = redact(FIXTURE_SDE_REAL)
+        check("00022e68" not in real,
+              "neither stored password blob survives a real .sde connection")
+        check(real.count(REDACTION) == 2,
+              "ENCRYPTED_PASSWORD and ENCRYPTED_PASSWORD_UTF8 both go")
+        check("INSTANCE=sde:sqlserver:gisdb01\\SQLEXPRESS" in real,
+              "the instance, which is what a decommissioning plan needs, stays")
+        check("USER=gis_viewer" in real and "VERSION=sde.DEFAULT" in real,
+              "the user and the version survive redaction")
+        real_props = parse_properties(FIXTURE_SDE_REAL)
+        check(real_props["INSTANCE"] == "sde:sqlserver:gisdb01\\SQLEXPRESS",
+              "a named instance keeps the backslash and the instance name")
+        check(real_props["AUTHENTICATION_MODE"] == "DBMS",
+              "the authentication mode is read from the same property set")
+        check(len(real_props) == 11,
+              "every property of the real connection string is parsed")
+        check(workspace_path(FIXTURE_SDE_REAL) is None,
+              "a real .sde DATABASE is a database on a server, not a folder")
+
         # ---- connection string properties
         props = parse_properties(FIXTURE_SDE)
         check(props["SERVER"] == "gisdb01", "the server property is read")
@@ -943,6 +1129,10 @@ def self_test():
               "a file geodatabase workspace is a path")
         check(workspace_path(FIXTURE_SDE) is None,
               "a remote DATABASE is a database name, not a path")
+        check(workspace_path("INSTANCE=sde:oracle11g:gisdb;DATABASE=sdeprod;"
+                             "USER=viewer") is None,
+              "a direct connect names an INSTANCE and no SERVER, and its "
+              "DATABASE is still not a folder")
         check(workspace_path("https://services.arcgis.com/x/FeatureServer/0")
               is None, "a service url is not a path")
         check(workspace_path("C:\\gis\\parcels.gdb") == "C:\\gis\\parcels.gdb",
@@ -968,6 +1158,35 @@ def self_test():
         check(check_presence("\\\\deadserver\\gis\\x.gdb", True,
                              exists=lambda p: False) is False,
               "--check-network turns the UNC stat on")
+        check(resolve("C:\\gis\\x.gdb", home) == "C:\\gis\\x.gdb",
+              "an absolute workspace path ignores the project home")
+        check(resolve("C:\\gis\\..\\gis\\x.gdb", home) == "C:\\gis\\x.gdb",
+              "a windows absolute path normalises in windows form on any host"
+              "  <-- pinned defect")
+        check(resolve("C:/gis/x.gdb", home) == "C:\\gis\\x.gdb",
+              "a forward-slash drive path is still windows absolute")
+        check(is_windows_absolute("C:\\gis") is True,
+              "a drive letter is windows absolute")
+        check(is_windows_absolute("\\\\srv\\share") is True,
+              "a UNC path is windows absolute")
+        check(is_windows_absolute("..\\commondata\\x.gdb") is False,
+              "a relative path is not windows absolute")
+        check(is_windows_absolute("C:") is False,
+              "a bare drive letter with no separator is not a path")
+        check(is_windows_absolute("") is False,
+              "an empty path is not windows absolute")
+        check(is_network_path("\\\\gis-fs\\projects\\x.gdb") is True,
+              "a UNC path is a network path")
+        check(is_network_path("C:\\gis\\x.gdb") is False,
+              "a local drive path is not")
+        check(is_network_path("") is False,
+              "and an empty path is not one either")
+        check(is_network_path("//gis-fs/projects/x.gdb") is True,
+              "a UNC path written with forward slashes is one too")
+        check(resolve("C:parcels.gdb", home) == "C:parcels.gdb",
+              "a drive-relative workspace is not joined onto the project home")
+        check(resolve("C:parcels.gdb", "/srv/proj") == "C:parcels.gdb",
+              "and it is left alone on a posix host too  <-- pinned defect")
 
         # ---- THE PINNED DEFECT: two serialisations of one object model
         xml_node = parse_cim(_fixture_layer_xml("L", "Parcels", "DATABASE=x.gdb"))
@@ -986,6 +1205,44 @@ def self_test():
               == [], "an empty ArrayOfString becomes a list, not an empty string")
         raises(lambda: parse_cim(b""),
                "an empty part raises rather than parsing to nothing")
+        repeated = parse_cim(
+            '<CustomProperties %s><Key>a</Key><Key>b</Key><Key>c</Key>'
+            '</CustomProperties>' % FIXTURE_NS)
+        check(repeated["key"] == ["a", "b", "c"],
+              "repeated sibling tags with no ArrayOf wrapper read as one list")
+        check("type" not in repeated,
+              "an element with no xsi:type carries no type member")
+        check(find_connection("CIMPATH=map/map.xml") is None,
+              "a reference string holds no connection")
+        stepped = {"extent": {"type": "CIMExtent", "xmin": "0"},
+                   "featuretable": {"type": "CIMFeatureTable",
+                                    "dataconnection": {
+                                        "type": "CIMStandardDataConnection",
+                                        "dataset": "Roads"}}}
+        check(find_connection(stepped)["dataset"] == "Roads",
+              "a member with no connection under it is stepped over, not "
+              "mistaken for one")
+        # The child is a bare object, not an array of one. CIM writes a
+        # one-element array that way often enough that as_list exists for it,
+        # and it is the shape that reaches find_connection as a dict it would
+        # happily descend into if the key were not skipped.
+        inline_group = parse_cim(json.dumps({
+            "type": "CIMGroupLayer", "name": "Utilities",
+            "layers": {"type": "CIMFeatureLayer", "name": "Mains",
+                       "featureTable": {"dataConnection": {
+                           "type": "CIMStandardDataConnection",
+                           "workspaceConnectionString": FIXTURE_GDB,
+                           "dataset": "Mains"}}}}))
+        check([s.layer for s in collect_sources(
+            "Group.lyrx", {DOCUMENT_ROOT: inline_group}, [DOCUMENT_ROOT],
+            home, False)] == ["Mains"],
+              "a group layer is not credited with the source of the child "
+              "layer written inline underneath it")
+        check(part_key({"a.xml": 1}, None) is None,
+              "a layer with no uri at all resolves to no part")
+        check(as_list("CIMPATH=x") == ["CIMPATH=x"],
+              "a one-element array written as a bare value reads as a list")
+        check(as_list(None) == [], "and a member that is absent reads as empty")
 
         # ---- THE PINNED DEFECT: zip entries differing only by case
         parts = {"Map/a.xml": 1, "map/map.xml": 2}
@@ -1027,6 +1284,11 @@ def self_test():
               "the query layer survives the scan of a whole project")
         check(len(document.sources) == 7,
               "all seven sources are reported, none lost to the case collision")
+        check(repr(document) == "Document(%s, OK, 7 source(s))" % aprx,
+              "a document prints its path, its status and its source count")
+        check(repr(by_layer["Owner Lookup"])
+              == "Source(Planning/Owner Lookup -> Owners)",
+              "a source prints the map, the layer and the dataset")
 
         # ---- the relative database path that is not there
         buried = by_layer["Buried Parcels"]
@@ -1076,6 +1338,79 @@ def self_test():
         check([s.layer for s in twice] == ["Shared"],
               "a layer a map and an unreferenced group both hold is reported "
               "once  <-- pinned defect")
+
+        # ---- the shapes a CIM document can take that a .lyrx does not
+        check(document_parts([1, 2]) == ({}, []),
+              "a json document that is not an object holds no parts")
+        bare_root = parse_cim(json.dumps({
+            "type": "CIMFeatureLayer", "name": "Solo",
+            "featureTable": {"dataConnection": {
+                "type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "DATABASE=solo.gdb",
+                "dataset": "Solo"}}}))
+        bare_parts, bare_roots = document_parts(bare_root)
+        check(bare_roots == [DOCUMENT_ROOT],
+              "a document with no definitions array is its own single part")
+        check([s.dataset for s in collect_sources(
+            "Bare.lyrx", bare_parts, bare_roots, home, False)] == ["Solo"],
+              "the layer such a document holds at its root is still reported  "
+              "<-- pinned defect")
+        mixed, _mixed_roots = document_parts(parse_cim(json.dumps({
+            "layerDefinitions": ["CIMPATH=dangling",
+                                 {"type": "CIMFeatureLayer", "name": "Real"}]})))
+        check(len(mixed) == 1,
+              "a definitions entry that is a reference and not an object is "
+              "skipped")
+
+        # ---- the nesting cap, and children that are not layers
+        capped = {"type": "CIMGroupLayer", "name": "G0"}
+        node = capped
+        for depth in range(MAX_NESTING_DEPTH + 4):
+            child = {"type": "CIMGroupLayer", "name": "G%d" % (depth + 1)}
+            node["layers"] = [child]
+            node = child
+        nested, _seen = walk_layers({DOCUMENT_ROOT: capped}, [DOCUMENT_ROOT])
+        check(len(nested) == MAX_NESTING_DEPTH + 1,
+              "inline nesting deeper than the cap is not followed")
+        # The cap itself is a tuning knob, so the assertion that matters is the
+        # one below it: a depth a person could really build must never be cut
+        # short. Sixty is a literal on purpose. Reading it off the constant
+        # would make the assertion move whenever the constant moved.
+        shallow = {"type": "CIMGroupLayer", "name": "S0"}
+        node = shallow
+        for depth in range(59):
+            child = {"type": "CIMFeatureLayer", "name": "S%d" % (depth + 1)}
+            node["layers"] = [child]
+            node = child
+        deep_enough, _deep_seen = walk_layers({DOCUMENT_ROOT: shallow},
+                                              [DOCUMENT_ROOT])
+        check(len(deep_enough) == 60,
+              "a sixty-deep chain is walked to its end, the cap never "
+              "truncates a project a person could build")
+        odd = parse_cim(json.dumps({
+            "type": "CIMMap", "name": "M", "layers": [
+                42,
+                {"type": "CIMFeatureLayer", "name": {"value": "not text"},
+                 "featureTable": {"dataConnection": {
+                     "type": "CIMStandardDataConnection", "dataset": "D"}}}]}))
+        odd_layers, _seen = walk_layers({DOCUMENT_ROOT: odd}, [DOCUMENT_ROOT])
+        check(len(odd_layers) == 1,
+              "a child layer that is not an object at all is skipped")
+        check(odd_layers[0][1] == "(unnamed)",
+              "a layer name that is not text reads as unnamed, it does not raise")
+
+        # ---- the four fields a .lyrx review is about
+        multi = parse_cim(json.dumps({
+            "type": "CIMFeatureLayer", "name": "Zoning",
+            "renderer": {"type": "CIMUniqueValueRenderer",
+                         "fields": ["ZONE", "CLASS"]}}))
+        signature = layer_signature(multi)
+        check(signature["rendererField"] == "ZONE, CLASS",
+              "a unique value renderer reports every field it breaks on")
+        check(signature["definitionQuery"] == "",
+              "a layer with no feature table has no definition query")
+        check(layer_signature({})["connection"] == "unknown",
+              "a layer with no connection signs as unknown rather than raising")
 
         # ---- one workspace string, two projects, two plan rows
         gone = os.path.join(workdir, "p2", "common", "x.gdb")
@@ -1131,6 +1466,94 @@ def self_test():
               "a .lyrx that is not JSON is UNSUPPORTED")
         check(scan_document(os.path.join(home, "gone.aprx")).status == UNSUPPORTED,
               "a document that cannot be opened at all is UNSUPPORTED")
+
+        zero = os.path.join(home, "Zero.lyrx")
+        handle = open(zero, "wb")
+        handle.close()
+        zero_doc = scan_document(zero)
+        check(zero_doc.status == UNSUPPORTED,
+              "a zero-byte document is UNSUPPORTED, not a project with no layers")
+        check(any("empty CIM part" in n for n in zero_doc.notes),
+              "and the note says the part was empty")
+
+        settings = os.path.join(home, "Settings.lyrx")
+        handle = open(settings, "w")
+        handle.write('{"theme": "dark", "recent": ["a.aprx"]}')
+        handle.close()
+        settings_doc = scan_document(settings)
+        check(settings_doc.status == UNSUPPORTED,
+              "a .lyrx that is valid json but names no CIM type is UNSUPPORTED  "
+              "<-- pinned defect")
+        check(settings_doc.sources == [],
+              "and it reports no sources, which is why it must not read OK")
+        check(any("not a CIM document" in n for n in settings_doc.notes),
+              "the note says the root object is not a CIM document")
+        lying = os.path.join(home, "Zipped.lyrx")
+        archive = zipfile.ZipFile(lying, "w")
+        archive.writestr("thumbnail.png", "not CIM either")
+        archive.close()
+        check(scan_document(lying).status == UNSUPPORTED,
+              "a .lyrx that is really a zip with no CIM parts is UNSUPPORTED")
+        lying_json = os.path.join(home, "Actually.aprx")
+        handle = open(lying_json, "w")
+        handle.write(_fixture_lyrx("Roads", "", "SPEED"))
+        handle.close()
+        lying_doc = scan_document(lying_json)
+        check(lying_doc.status == OK and lying_doc.sources[0].dataset == "Roads",
+              "an .aprx that is really CIM json still scans, the dispatch is on "
+              "the bytes and not on the extension")
+
+        # ---- .mapx and .pagx, the two document types with no zip and no array
+        mapx = os.path.join(home, "Zoning.mapx")
+        handle = open(mapx, "w")
+        handle.write(_fixture_mapx())
+        handle.close()
+        mapx_doc = scan_document(mapx)
+        mapx_layers = dict((s.layer, s) for s in mapx_doc.sources)
+        check(mapx_doc.status == OK, "a .mapx scans OK")
+        check(sorted(mapx_layers) == ["Owner Lookup", "Parcels"],
+              "a standalone table the .mapx map holds is reported, not dropped  "
+              "<-- pinned defect")
+        check(mapx_layers["Parcels"].container == "Zoning Review",
+              "the .mapx layer is attributed to the map inside the document  "
+              "<-- pinned defect")
+        check(mapx_layers["Parcels"].state == MISSING,
+              "its relative file geodatabase is resolved and checked like any "
+              "other")
+        check("00022e68" not in json.dumps(mapx_doc.to_dict()),
+              "no stored .sde password reaches the .mapx output")
+        check(mapx_layers["Owner Lookup"].dataset == "GIS.Owners",
+              "the uRI spelling a real CIM document uses still resolves")
+
+        pagx = os.path.join(home, "Board.pagx")
+        handle = open(pagx, "w")
+        handle.write(_fixture_pagx())
+        handle.close()
+        pagx_doc = scan_document(pagx)
+        check(pagx_doc.status == OK, "a .pagx scans OK")
+        check([s.layer for s in pagx_doc.sources] == ["Roads"],
+              "the layer inside the layout's map frame is reported")
+        check(pagx_doc.sources[0].container == "Inset",
+              "and it is attributed to the map the layout frames")
+        check(REDACTION in pagx_doc.sources[0].workspace,
+              "the .sde credential in a .pagx is redacted like any other")
+        # A layout template holds a layoutDefinition and nothing else. Leaving
+        # that member out of the part table sent the whole document through the
+        # root sentinel, and the document object itself came back as a layer
+        # called "(unnamed)": a row in the report that names nothing at all.
+        layout_only = parse_cim(json.dumps({
+            "type": "CIMLayoutDocument", "version": "3.5.0",
+            "layoutDefinition": {
+                "type": "CIMLayout", "name": "Blank Board",
+                "uRI": "CIMPATH=layout/layout.xml",
+                "elements": [{"type": "CIMMapFrame", "name": "Frame"}]}}))
+        only_parts, only_roots = document_parts(layout_only)
+        check(only_roots == ["CIMPATH=layout/layout.xml"],
+              "a .pagx holding only a layout indexes the layout as its part")
+        only_layers, _only_seen = walk_layers(only_parts, only_roots)
+        check(only_layers == [],
+              "so the document itself is never reported as an unnamed layer  "
+              "<-- pinned defect")
 
         # ---- the --json payload
         payload = json_report([document, result], "gisdb01", root=workdir)
@@ -1198,6 +1621,126 @@ def self_test():
         kinds = [c[0] for c in diff_documents(before, renamed)]
         check("layer removed" in kinds and "layer added" in kinds,
               "a renamed layer reads as one removed and one added")
+        rendered = diff_lines(diff_documents(before, renamed))
+        check(rendered[-1] == "2 change(s)",
+              "the rendered diff counts the changes it printed")
+        check("layer removed: ACLED" in rendered,
+              "the removed layer is named")
+        check("   before: ACLED" in rendered,
+              "a removal prints a before side and no after side")
+        check("   after:  Renamed" in rendered,
+              "an addition prints an after side and no before side")
+        check(len(rendered) == 6,
+              "neither half of a rename prints an empty side")
+        check(diff_lines([])[0].startswith("no semantic difference"),
+              "two identical documents render as one line saying so")
+
+        # ---- the command line, end to end
+        handle = open(os.path.join(home, "Planning.aprx.bak"), "w")
+        handle.write("the backup Pro leaves beside a project")
+        handle.close()
+        walked = find_documents(home)
+        check(not any(p.endswith(".bak") for p in walked),
+              "a backup file beside a project is not walked as a document")
+        check(len(walked) == 12,
+              "the directory walk finds every document in the tree")
+        check(sorted(set(os.path.splitext(p)[1] for p in walked))
+              == [".aprx", ".lyrx", ".mapx", ".pagx"],
+              "all four extensions the README claims are walked")
+        code, out = run([home])
+        check(code == 1, "a tree holding an unreadable document exits 1")
+        check("Zoning.mapx" in out and "Board.pagx" in out,
+              "the report names the .mapx and the .pagx it scanned")
+        check("6 OK, 6 UNSUPPORTED" in out,
+              "the footer separates the readable documents from the rest")
+        code, out = run([home, "--filter", "gisdb01"])
+        check("Zoning A" in out, "--filter keeps a layer on the matched server")
+        check("Buried Parcels" not in out,
+              "--filter drops a layer that does not match")
+        check("Conflict.lyrx" not in out,
+              "a document whose every source the filter rejected stays quiet")
+        check("Notes.lyrx" in out,
+              "an UNSUPPORTED document is printed whatever the filter says")
+        code, out = run([home, "--json", "--filter", "GIS.Owners"])
+        payload = json.loads(out)
+        check(payload["root"] == home, "--json names the root it scanned")
+        check([s["layer"] for d in payload["documents"] for s in d["sources"]]
+              == ["Owner Lookup"],
+              "--json --filter reports the one source that matched")
+        # The authorisation flags, end to end, against a path that really is
+        # stat-ed. "\\\\.\\" is the Win32 device namespace: it is shaped like a
+        # UNC path, so it takes the network branch, and the object manager
+        # resolves it locally. No server, no share, no SMB timeout. Elsewhere it
+        # is an ordinary relative name that is also not there. Either way the
+        # stat runs for real and answers False, so the flag moving the verdict
+        # from unknown to MISSING is the stat happening and nothing else.
+        unc = os.path.join(home, "Unc.lyrx")
+        handle = open(unc, "w")
+        handle.write(json.dumps({
+            "type": "CIMLayerDocument", "version": "3.5.0",
+            "layers": ["CIMPATH=unc.json"],
+            "layerDefinitions": [{
+                "type": "CIMFeatureLayer", "name": "UNC Parcels",
+                "uRI": "CIMPATH=unc.json",
+                "featureTable": {"type": "CIMFeatureTable", "dataConnection": {
+                    "type": "CIMStandardDataConnection",
+                    "workspaceConnectionString":
+                        "DATABASE=\\\\.\\nosuchshare\\parcels.gdb",
+                    "dataset": "Parcels"}}}]}))
+        handle.close()
+        code, out = run([unc])
+        check(code == 0 and UNKNOWN in out and MISSING not in out,
+              "a UNC source is unknown while the network check is off")
+        code, out = run([unc, "--check-network"])
+        check(code == 0 and MISSING in out,
+              "--check-network stats it for real and calls it MISSING")
+        code, out = run([unc, "--apply"])
+        check(code == 0 and MISSING in out,
+              "--apply authorises that same stat, which is all --apply does")
+        code, out = run([mapx, "--apply"])
+        check(code == 0 and "Owner Lookup" in out,
+              "and it scans the document exactly as it would without the flag")
+        code, out = run([])
+        check(code == 64, "no argument at all is a usage error")
+        check("--self-test" in out, "and the message says how to try the tool")
+        code, out = run([os.path.join(home, "nowhere")])
+        check(code == 2, "a scan path that does not exist exits 2")
+        nothing = os.path.join(workdir, "no-documents")
+        os.makedirs(nothing)
+        code, out = run([nothing])
+        check(code == 0 and "no .aprx, .lyrx, .mapx or .pagx" in out,
+              "a folder holding no documents exits 0 and says so")
+
+        shouty = os.path.join(workdir, "shouty")
+        os.makedirs(shouty)
+        handle = open(os.path.join(shouty, "Legacy.LYRX"), "w")
+        handle.write(_fixture_lyrx("Roads", "", "SPEED"))
+        handle.close()
+        check([os.path.basename(p) for p in find_documents(shouty)]
+              == ["Legacy.LYRX"],
+              "an extension in capitals is still an ArcGIS document")
+        code, out = run([shouty])
+        check(code == 0 and "Roads" in out,
+              "and the walk hands it to the scanner like any other")
+
+        repointed = os.path.join(home, "Conflict2.lyrx")
+        handle = open(repointed, "w")
+        handle.write(_fixture_lyrx("ACLED_2019_2024", "YEAR >= 2019", "EVENTS"))
+        handle.close()
+        code, out = run(["--diff", lyrx, repointed])
+        check(code == 0, "--diff on two readable documents exits 0")
+        check("definition query changed: ACLED" in out and "3 change(s)" in out,
+              "--diff prints the three fields that moved")
+        code, out = run(["--diff", lyrx, repointed, "--json"])
+        check([c["change"] for c in json.loads(out)] ==
+              ["source repointed", "definition query changed",
+               "renderer field changed"],
+              "--diff --json emits the same three changes as data")
+        code, out = run(["--diff", lyrx, os.path.join(home, "gone.lyrx")])
+        check(code == 2, "--diff against a document that is not there exits 2")
+        code, out = run(["--diff", lyrx, notcim])
+        check(code == 1, "--diff on a document that will not parse exits 1")
+        check(UNSUPPORTED in out, "and it says which document was unreadable")
 
         # ---- argument handling
         args = _parse([workdir])

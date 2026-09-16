@@ -15,9 +15,9 @@ $ python cimscan.py --self-test
 cimscan self-test: no arcpy, no licence, no network
 --------------------------------------------------------------------
 PASS  a stored password never survives redaction
-PASS  the server name is kept, it is the whole point of the scan
 PASS  a stored portal TOKEN never survives redaction  <-- pinned defect
 PASS  a token in a service URL query string is redacted too  <-- pinned defect
+PASS  neither stored password blob survives a real .sde connection
 ...
 PASS  an .aprx part is CIM XML and parses  <-- pinned defect
 PASS  a .lyrx is bare CIM JSON and parses  <-- pinned defect
@@ -25,16 +25,25 @@ PASS  a case-colliding CIMPATH still resolves  <-- pinned defect
 PASS  a query connection with no Dataset does not raise  <-- pinned defect
 ...
 PASS  a layer three group layers deep is still found
-PASS  a CIMStandaloneTable is found
 PASS  all seven sources are reported, none lost to the case collision
-PASS  four zoning layers and one query layer share a single .sde row
 PASS  a layer a map and an unreferenced group both hold is reported once  <-- pinned defect
+PASS  the layer such a document holds at its root is still reported  <-- pinned defect
 PASS  one relative workspace string in two projects is two plan rows  <-- pinned defect
 ...
 PASS  a zip whose parts do not parse is UNSUPPORTED, not clean  <-- pinned defect
+PASS  a zero-byte document is UNSUPPORTED, not a project with no layers
+PASS  a .lyrx that is valid json but names no CIM type is UNSUPPORTED  <-- pinned defect
+PASS  a standalone table the .mapx map holds is reported, not dropped  <-- pinned defect
+PASS  the .mapx layer is attributed to the map inside the document  <-- pinned defect
+PASS  a .pagx scans OK
+PASS  so the document itself is never reported as an unnamed layer  <-- pinned defect
 PASS  a layer name the console codepage cannot encode does not kill the scan  <-- pinned defect
+...
+PASS  --filter drops a layer that does not match
+PASS  --apply authorises that same stat, which is all --apply does
+PASS  --diff --json emits the same three changes as data
 --------------------------------------------------------------------
-102 assertions, 0 failed
+199 assertions, 0 failed
 ```
 
 ## Requirements
@@ -110,6 +119,20 @@ workspaces: 11 source(s) across 4 workspace(s)
 1 document(s), 1 OK, 0 UNSUPPORTED, 11 source(s), 0 missing
 ```
 
+A `.mapx` and a `.pagx` are reported the same way. This is the self-test fixture, built from the CIM
+spec, because no `.mapx` saved by Pro was available here:
+
+```
+$ python cimscan.py Zoning.mapx
+== Zoning.mapx  [OK]
+   MISSING  Zoning Review > Parcels            Parcels                  DATABASE=..\commondata\parcels.gdb
+   unknown  Zoning Review > Owner Lookup       GIS.Owners               ENCRYPTED_PASSWORD=***REDACTED***;ENCRYPTED_PASSWORD_UTF8=***REDACTED***;SERVER=gisdb01;...
+```
+
+The standalone table is the part that is easy to lose. A `.mapx` holds it in
+`standaloneTableDefinitions`, beside the layers and not inside the map. A reader that walks only
+`layerDefinitions` drops it, and prints a clean report with one source missing.
+
 A plan row names the resolved path as well as the workspace string. Two projects both saying
 `DATABASE=..\commondata\parcels.gdb` mean two different folders, so they stay two rows. Keying the
 row on the text alone let a geodatabase that was gone hide behind a row reading `present`.
@@ -117,14 +140,26 @@ row on the text alone let a geodatabase that was gone hide behind a row reading 
 ## What it refuses
 
 It refuses to report an unreadable document as a clean one. A document whose container will not
-open, whose parts will not parse, or that holds no CIM parts at all, is marked `UNSUPPORTED`,
-counted separately, and drives the exit code to 1.
+open, whose parts will not parse, that holds no CIM parts at all, or whose root object names no CIM
+type, is marked `UNSUPPORTED`, counted separately, and drives the exit code to 1.
 
 ```
 == mixed\Truncated.aprx  [UNSUPPORTED]
    ! could not open: File is not a zip file
    (no data sources read)
+
+== mixed\Settings.lyrx  [UNSUPPORTED]
+   ! the root object is not a CIM document
+   (no data sources read)
+
+== mixed\Zero.lyrx  [UNSUPPORTED]
+   ! part Zero.lyrx did not parse: empty CIM part
+   (no data sources read)
 ```
+
+The second one is the quiet case. A file that is valid JSON and is not a CIM document parses without
+an error and holds no layers, so a scanner that trusts the parse reports it as a document with
+nothing to worry about.
 
 This is the whole point. A scanner that returns zero sources for a file it could not open reports
 the project as having nothing to worry about, which is the one answer that is certainly wrong. A
@@ -220,8 +255,11 @@ Two format facts cost more time than anything else here, and both are pinned by 
   hold a table that was dropped last week.
 - Layer types it has no rule for are reported by their connection type with whatever workspace and
   dataset members they carry. It does not pretend to know every CIM class Pro supports.
-- `.pagx` and `.mapx` are read as CIM JSON like a `.lyrx`. Layouts are walked for the maps they
-  reference, but layout elements that carry their own source are not specially handled.
+- `.mapx` and `.pagx` are read as CIM JSON like a `.lyrx`. A `.mapx` names its map `mapDefinition`
+  and a `.pagx` names its layout `layoutDefinition`, both singular. Both keep their standalone tables
+  in `standaloneTableDefinitions`. All three members are read, so a layer reports the map that holds
+  it and a standalone table is not dropped. A layout element that carries its own source, instead of
+  framing a map, is not specially handled.
 - The diff compares source, definition query, renderer field and connection type. It says nothing
   about symbology, labelling, pop-ups or scale ranges.
 - It never writes to a document and never repairs one. Repointing a broken layer is
