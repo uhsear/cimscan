@@ -39,11 +39,13 @@ PASS  a .pagx scans OK
 PASS  so the document itself is never reported as an unnamed layer  <-- pinned defect
 PASS  a layer name the console codepage cannot encode does not kill the scan  <-- pinned defect
 ...
+PASS  an unreadable subdirectory is counted, not walked past  <-- pinned defect
+PASS  an unreadable directory reaches exit 1, as UNSUPPORTED does
 PASS  --filter drops a layer that does not match
 PASS  --apply authorises that same stat, which is all --apply does
 PASS  --diff --json emits the same three changes as data
 --------------------------------------------------------------------
-199 assertions, 0 failed
+205 assertions, 0 failed
 ```
 
 ## Requirements
@@ -116,7 +118,7 @@ workspaces: 11 source(s) across 4 workspace(s)
       1  unknown  http://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer
       ...
 
-1 document(s), 1 OK, 0 UNSUPPORTED, 11 source(s), 0 missing
+1 document(s), 1 OK, 0 UNSUPPORTED, 11 source(s), 0 missing, 0 unreadable directory(s)
 ```
 
 A `.mapx` and a `.pagx` are reported the same way. This is the self-test fixture, built from the CIM
@@ -165,6 +167,22 @@ This is the whole point. A scanner that returns zero sources for a file it could
 the project as having nothing to worry about, which is the one answer that is certainly wrong. A
 document with one bad part is `UNSUPPORTED` too, even though the other parts were read, because the
 sources listed are then a floor and not the whole truth.
+
+It refuses to walk past a folder it could not read, for the same reason. `os.walk` reports a
+directory it cannot list by calling `onerror`, and does nothing at all when no `onerror` is passed.
+Two sibling folders each holding a `proj.aprx` reported `2 document(s)`; with read denied on one of
+them the same scan reported `1 document(s)` and exited on the documents it did find. A folder that
+is off limits and a folder that is empty read the same. Both are now named, counted in the footer,
+and drive the exit code to 1:
+
+```
+!! cannot list projects\archive: Access is denied
+1 document(s), 0 OK, 1 UNSUPPORTED, 0 source(s), 0 missing, 1 unreadable directory(s)
+```
+
+`--json` carries the same list under `unreadable_directories`, so the two output modes cannot
+disagree about what the scan covered. The documents inside such a folder were never opened, so
+nothing is claimed about them: the count says only how much of the tree the report does not cover.
 
 It also refuses to print a secret. An `.sde` connection string saved with a stored credential holds
 `PASSWORD=` or `ENCRYPTED_PASSWORD=` in clear text inside the document. Any key whose name contains
@@ -222,8 +240,8 @@ where a credential would otherwise reach a pull request.
 
 ## Exit codes
 
-0 every document parsed, 1 at least one `UNSUPPORTED`, 2 the scan path could not be read, 64 usage
-error.
+0 every document parsed and every directory listed, 1 at least one `UNSUPPORTED` or at least one
+directory that could not be listed, 2 the scan path could not be read, 64 usage error.
 
 ## Why not arcpy
 
@@ -267,6 +285,8 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - XML is parsed with the standard library's `ElementTree`. It does not fetch external entities, but
   a deliberately malicious document can still cost memory through nested internal entities. Scan
   documents you own.
+- An unreadable directory is reported once, by the path the walk was refused. Its subfolders are
+  never reached, so one line can stand for a whole branch of the tree.
 - Row counts, field lists and spatial references are out of scope. This answers "what does it point
   at", not "what is in it".
 - A layer name holding characters the console codepage cannot encode prints as `?`. The scan

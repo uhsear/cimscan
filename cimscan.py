@@ -704,12 +704,22 @@ def scan_document(path, check_network=False, exists=os.path.exists):
     return Document(path, UNSUPPORTED if notes else OK, sources, notes)
 
 
-def find_documents(root):
-    """Every ArcGIS Pro document under root, or root itself when it is a file."""
+def find_documents(root, unreadable=None):
+    """Every ArcGIS Pro document under root, or root itself when it is a file.
+
+    A folder the walk cannot list is appended to unreadable as the OSError the
+    operating system raised for it. Without onerror= os.walk swallows that
+    error, so a denied folder and an empty one look identical: fewer documents,
+    no message, clean exit. That is the same lie as reporting zero sources for a
+    document nobody could open, and the docstring at the top of this file says
+    this tool refuses to tell it.
+    """
     if os.path.isfile(root):
         return [root]
+    if unreadable is None:
+        unreadable = []
     found = []
-    for folder, _dirs, files in os.walk(root):
+    for folder, _dirs, files in os.walk(root, onerror=unreadable.append):
         for name in sorted(files):
             if name.lower().endswith(DOCUMENT_EXTENSIONS):
                 found.append(os.path.join(folder, name))
@@ -718,7 +728,7 @@ def find_documents(root):
 
 # ------------------------------------------------------------------- reporting
 
-def report_lines(documents, text_filter=None):
+def report_lines(documents, text_filter=None, unreadable=()):
     """Render the scan as the lines the CLI prints."""
     lines = []
     total, missing, unsupported = 0, 0, 0
@@ -761,13 +771,18 @@ def report_lines(documents, text_filter=None):
         lines.append("   %4d  %-8s %s"
                      % (group["count"], group["state"], label))
     lines.append("")
-    lines.append("%d document(s), %d OK, %d UNSUPPORTED, %d source(s), %d missing"
+    for error in unreadable:
+        # Named, not only counted: what the scan does not cover is the part of
+        # the tree you have to go and look at yourself.
+        lines.append("!! cannot list %s: %s" % (error.filename, error.strerror))
+    lines.append("%d document(s), %d OK, %d UNSUPPORTED, %d source(s), "
+                 "%d missing, %d unreadable directory(s)"
                  % (len(documents), len(documents) - unsupported, unsupported,
-                    total, missing))
+                    total, missing, len(unreadable)))
     return lines
 
 
-def json_report(documents, text_filter=None, root=None):
+def json_report(documents, text_filter=None, root=None, unreadable=()):
     """The --json payload, filtered the way the text report is.
 
     --filter reached the workspace summary but not the document list, so the
@@ -784,7 +799,8 @@ def json_report(documents, text_filter=None, root=None):
         payload.append(entry)
     return {"root": root,
             "documents": payload,
-            "workspaces": group_by_workspace(shown)}
+            "workspaces": group_by_workspace(shown),
+            "unreadable_directories": [e.filename for e in unreadable]}
 
 
 def diff_lines(changes):
@@ -905,6 +921,35 @@ def _build_fixture_aprx(target):
     finally:
         archive.close()
     return target
+
+
+def _deny_read(path):
+    """Make path unlistable for this user and return the undo. Self-test only.
+
+    The walk hardening cannot be asserted against a mock, because os.walk calls
+    onerror= only when the operating system actually refuses. Windows needs an
+    ACL, since a chmod there sets the read-only flag and the folder still lists;
+    POSIX needs the chmod, since it has no icacls. Neither needs admin rights.
+
+    The denied right is (RD), list-directory, and not the (RX) an ACL example
+    usually reaches for. (RX) also denies READ_CONTROL, and the owner cannot
+    then read the folder's own ACL back: icacls /remove:d returns 5, the undo
+    below never runs, and the temporary folder outlives the self-test.
+    """
+    import getpass
+    import subprocess
+
+    if os.name == "nt":
+        user = getpass.getuser()
+
+        def icacls(*flags):
+            subprocess.check_output(["icacls", path] + list(flags),
+                                    stderr=subprocess.STDOUT)
+
+        icacls("/deny", "%s:(RD)" % user)
+        return lambda: icacls("/remove:d", user)
+    os.chmod(path, 0o000)
+    return lambda: os.chmod(path, 0o700)
 
 
 def _fixture_lyrx(dataset, query, field, name="ACLED"):
@@ -1647,6 +1692,36 @@ def self_test():
         check(sorted(set(os.path.splitext(p)[1] for p in walked))
               == [".aprx", ".lyrx", ".mapx", ".pagx"],
               "all four extensions the README claims are walked")
+        # ---- a directory the walk cannot list, against a real ACL
+        blocked = os.path.join(workdir, "blocked")
+        os.makedirs(os.path.join(blocked, "locked"))
+        handle = open(os.path.join(blocked, "locked", "Hidden.lyrx"), "w")
+        handle.write(_fixture_lyrx("Roads", "", "SPEED"))
+        handle.close()
+        undo = _deny_read(os.path.join(blocked, "locked"))
+        try:
+            denied = []
+            check(find_documents(blocked, denied) == [] and len(denied) == 1,
+                  "an unreadable subdirectory is counted, not walked past"
+                  "  <-- pinned defect")
+            code, out = run([blocked])
+            check(code == 1,
+                  "an unreadable directory reaches exit 1, as UNSUPPORTED does")
+            check("1 unreadable directory(s)" in out and "locked" in out,
+                  "and the report names the directory it could not list")
+            code, out = run([blocked, "--json"])
+            check(json.loads(out)["unreadable_directories"]
+                  == [os.path.join(blocked, "locked")],
+                  "--json names it too, so the two modes cannot disagree")
+        finally:
+            undo()
+        code, out = run([blocked])
+        check(code == 0 and "0 unreadable directory(s)" in out,
+              "the same tree exits 0 once the folder can be listed again")
+        readable = []
+        find_documents(home, readable)
+        check(readable == [], "a fully readable root reports none unreadable")
+
         code, out = run([home])
         check(code == 1, "a tree holding an unreadable document exits 1")
         check("Zoning.mapx" in out and "Board.pagx" in out,
@@ -1863,8 +1938,9 @@ def main(argv=None):
         print("error: no such path: %s" % args.root, file=sys.stderr)
         return 2
 
-    paths = find_documents(args.root)
-    if not paths:
+    unreadable = []
+    paths = find_documents(args.root, unreadable)
+    if not paths and not unreadable:
         print("no .aprx, .lyrx, .mapx or .pagx documents under %s" % args.root)
         return 0
 
@@ -1872,15 +1948,18 @@ def main(argv=None):
     documents = [scan_document(p, check_network) for p in paths]
 
     if args.json:
-        print(json.dumps(json_report(documents, args.filter, args.root),
-                         indent=2))
+        print(json.dumps(json_report(documents, args.filter, args.root,
+                                     unreadable), indent=2))
     else:
-        for line in report_lines(documents, args.filter):
+        for line in report_lines(documents, args.filter, unreadable):
             print(line)
 
     # An unreadable document is the failure this tool exists to surface, so it
     # has to reach the exit code. A pipeline that only reads stdout still stops.
-    return 1 if any(d.status == UNSUPPORTED for d in documents) else 0
+    # A directory the walk could not list is that same failure one level up:
+    # the documents inside it were never scanned and never counted.
+    return 1 if unreadable or any(d.status == UNSUPPORTED
+                                  for d in documents) else 0
 
 
 if __name__ == "__main__":
