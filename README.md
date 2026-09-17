@@ -290,3 +290,4 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [agol-relink](https://github.com/uhsear/agol-relink) - the same dead service URL, hunted across Portal content instead of files on disk
 - [gdbxray](https://github.com/uhsear/gdbxray) - what the geodatabase at the end of those data sources actually holds
+- [stalehost](https://github.com/uhsear/stalehost) - find the same stale host in files cimscan cannot parse, by matching raw bytes
