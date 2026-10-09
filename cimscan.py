@@ -1832,6 +1832,17 @@ def self_test():
         check(_parse([workdir, "--check-network"]).check_network is True,
               "--check-network is read")
         check(_parse([workdir, "--apply"]).apply is True, "--apply is read")
+        saved_err = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            _parse([workdir, "--ap"])
+            refused = False
+        except SystemExit:
+            refused = True
+        finally:
+            sys.stderr = saved_err
+        check(refused, "a unique prefix of --apply is refused by the parser"
+              "  <-- pinned defect")
         check(_parse(["--diff", "a.lyrx", "b.lyrx"]).diff == ["a.lyrx", "b.lyrx"],
               "--diff takes exactly two documents")
     finally:
@@ -1853,6 +1864,7 @@ def self_test():
 def _parse(argv):
     parser = argparse.ArgumentParser(
         prog="cimscan.py",
+        allow_abbrev=False,
         description="Report every data source in a tree of .aprx, .lyrx, .mapx "
                     "and .pagx files with no ArcGIS licence, and refuse to call "
                     "an unreadable project a clean one.",

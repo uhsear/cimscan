@@ -44,8 +44,9 @@ PASS  an unreadable directory reaches exit 1, as UNSUPPORTED does
 PASS  --filter drops a layer that does not match
 PASS  --apply authorises that same stat, which is all --apply does
 PASS  --diff --json emits the same three changes as data
+PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 --------------------------------------------------------------------
-205 assertions, 0 failed
+206 assertions, 0 failed
 ```
 
 ## Requirements
