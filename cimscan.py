@@ -46,6 +46,16 @@ DOCUMENT_EXTENSIONS = (".aprx", ".lyrx", ".mapx", ".pagx")
 # Entries inside a zipped document that are worth parsing as CIM.
 CIM_PART_EXTENSIONS = (".xml", ".json")
 
+# Extensions that name a real ArcGIS file this tool does not read. The value is
+# the whole note, so the user learns the file type and where to go next. An
+# .sde is a database connection file (Esri: "a file that ArcGIS uses to connect
+# to a database"), not a CIM document, and stalehost reads it as bytes.
+NOT_CIM = {
+    ".sde": "an .sde is an ArcGIS database connection file, not a CIM "
+            "document, so cimscan does not open it. To find a stale host in "
+            ".sde files, use stalehost: https://github.com/uhsear/stalehost",
+}
+
 # What a redacted secret is replaced with. This is what lands in the text
 # report, in --json and in --diff.
 REDACTION = "***REDACTED***"
@@ -316,7 +326,7 @@ def is_windows_absolute(path):
     return len(path) > 2 and path[1] == ":" and path[2] in ("/", chr(92))
 
 
-def resolve(path, home):
+def resolve(path, home, isabs=os.path.isabs):
     r"""Resolve a workspace path against the project home directory.
 
     Pro saves relative paths by default, so a workspace of
@@ -336,7 +346,7 @@ def resolve(path, home):
     if is_windows_absolute(path) or path[1:2] == ":":
         return ntpath.normpath(path)
     native = path.replace(chr(92), os.sep).replace("/", os.sep)
-    if os.path.isabs(native):
+    if isabs(native):
         return os.path.normpath(native)
     return os.path.normpath(os.path.join(home, native))
 
@@ -361,6 +371,17 @@ def check_presence(path, check_network, exists=os.path.exists):
     if is_network_path(path) and not check_network:
         return None
     return bool(exists(path))
+
+
+def not_cim_note(path):
+    """The note for a file type cimscan names and refuses, or None.
+
+    An .sde given to the CIM parser failed with "not well-formed (invalid
+    token)", which is true and tells the user nothing. The decision is on the
+    extension alone, so the file is never opened: an .sde can hold a saved
+    credential and none of its bytes are needed to name it.
+    """
+    return NOT_CIM.get(os.path.splitext(path or "")[1].lower())
 
 
 def find_connection(node):
@@ -668,6 +689,9 @@ def read_parts(path):
 def scan_document(path, check_network=False, exists=os.path.exists):
     """Scan one document. Never raises; an unreadable one becomes UNSUPPORTED."""
     home = os.path.dirname(os.path.abspath(path))
+    named = not_cim_note(path)
+    if named:
+        return Document(path, UNSUPPORTED, [], [named])
     try:
         raw_parts = read_parts(path)
     except Exception as exc:
@@ -1065,32 +1089,56 @@ def _fixture_pagx():
     })
 
 
+class _Tally(object):
+    """The self-test's check()/raises() harness and its footer.
+
+    A class and not closures, so the failing paths can be run on purpose: a
+    harness that has never been seen to report a failure is a control that
+    cannot fail, and a green run would look the same either way.
+    """
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = []
+
+    def check(self, cond, label):
+        if cond:
+            self.passed += 1
+            print("PASS  %s" % label)
+        else:
+            self.failed.append(label)
+            print("FAIL  %s" % label)
+
+    def raises(self, fn, label):
+        try:
+            fn()
+        except ValueError:
+            self.check(True, label)
+        except Exception as exc:
+            self.check(False, "%s (wrong exception %r)" % (label, exc))
+        else:
+            self.check(False, "%s (no error raised)" % label)
+
+    def finish(self):
+        print("-" * 68)
+        total = self.passed + len(self.failed)
+        if self.failed:
+            print("%d assertions, %d failed" % (total, len(self.failed)))
+            for label in self.failed:
+                print("  FAILED: %s" % label)
+            return 1
+        print("%d assertions, 0 failed" % total)
+        return 0
+
+
 def self_test():
     """Assertions over the parser and the decision core. No arcpy, no network."""
     import io
     import shutil
     import tempfile
 
-    passed = [0]
-    failed = []
-
-    def check(cond, label):
-        if cond:
-            passed[0] += 1
-            print("PASS  %s" % label)
-        else:
-            failed.append(label)
-            print("FAIL  %s" % label)
-
-    def raises(fn, label):
-        try:
-            fn()
-        except ValueError:
-            check(True, label)
-        except Exception as exc:
-            check(False, "%s (wrong exception %r)" % (label, exc))
-        else:
-            check(False, "%s (no error raised)" % label)
+    tally = _Tally()
+    check, raises = tally.check, tally.raises
 
     def run(argv):
         """main() with both streams captured, returning (exit code, output)."""
@@ -1232,6 +1280,10 @@ def self_test():
               "a drive-relative workspace is not joined onto the project home")
         check(resolve("C:parcels.gdb", "/srv/proj") == "C:parcels.gdb",
               "and it is left alone on a posix host too  <-- pinned defect")
+        check(resolve("/srv/x.gdb", home, isabs=lambda p: True)
+              == os.path.normpath("/srv/x.gdb"),
+              "a path the host calls absolute ignores the project home, "
+              "decided here with isabs injected so Windows takes the branch")
 
         # ---- THE PINNED DEFECT: two serialisations of one object model
         xml_node = parse_cim(_fixture_layer_xml("L", "Parcels", "DATABASE=x.gdb"))
@@ -1630,8 +1682,6 @@ def self_test():
         sys.stdout = narrow
         try:
             code = main([wide])
-        except UnicodeEncodeError:
-            code = "UnicodeEncodeError"
         finally:
             sys.stdout = saved_stdout
         check(code == 0,
@@ -1817,6 +1867,81 @@ def self_test():
         check(code == 1, "--diff on a document that will not parse exits 1")
         check(UNSUPPORTED in out, "and it says which document was unreadable")
 
+        # ---- the harness itself reports a failure when it sees one
+        probe = _Tally()
+        shown = io.StringIO()
+        saved_stdout = sys.stdout
+        sys.stdout = shown
+        try:
+            probe.check(False, "deliberate")
+            probe.raises(lambda: None, "no error")
+            probe.raises(lambda: 1 // 0, "wrong error")
+            probe.raises(lambda: int("x"), "right error")
+            probe_code = probe.finish()
+        finally:
+            sys.stdout = saved_stdout
+        check(probe_code == 1 and probe.passed == 1 and len(probe.failed) == 3,
+              "the harness counts three failures and one pass, and exits 1")
+        check("FAIL  deliberate" in shown.getvalue()
+              and "(no error raised)" in shown.getvalue()
+              and "(wrong exception" in shown.getvalue()
+              and "4 assertions, 3 failed" in shown.getvalue()
+              and "  FAILED: deliberate" in shown.getvalue(),
+              "and it names each failure, so a red run cannot read as green")
+
+        # ---- the file is a program and a module
+        import runpy
+        loaded = runpy.run_path(os.path.abspath(__file__),
+                                run_name="cimscan_import")
+        check(callable(loaded["main"]) and loaded["OK"] == OK,
+              "loading the file as a module defines main and runs nothing")
+
+        # ---- an .sde on the command line is named, not misread as XML
+        check(not_cim_note("prod.sde") is not None
+              and "stalehost" in not_cim_note("prod.sde")
+              and ".sde" in not_cim_note("prod.sde"),
+              "the note names the .sde file type and points at stalehost")
+        check(not_cim_note("PROD.SDE") == not_cim_note("prod.sde"),
+              "an .sde in capitals is named the same way")
+        check(not_cim_note("Zoning.lyrx") is None
+              and not_cim_note("noextension") is None
+              and not_cim_note("") is None and not_cim_note(None) is None,
+              "a CIM document, a bare name and no name get no such note")
+        sdedir = os.path.join(workdir, "sdedir")
+        os.makedirs(sdedir)
+        sde = os.path.join(sdedir, "Prod.sde")
+        handle = open(sde, "wb")
+        handle.write(b"\x00\x01SERVER=gisdb01;PASSWORD=hunter2\xff")
+        handle.close()
+        sde_doc = scan_document(sde)
+        check(sde_doc.status == UNSUPPORTED and sde_doc.sources == [],
+              "an .sde is UNSUPPORTED with no sources, as it was before")
+        check(len(sde_doc.notes) == 1 and "stalehost" in sde_doc.notes[0]
+              and "invalid token" not in sde_doc.notes[0],
+              "its note names stalehost instead of an XML parse error  "
+              "<-- pinned defect")
+        gone_sde = scan_document(os.path.join(sdedir, "gone.sde"))
+        check(gone_sde.notes == sde_doc.notes,
+              "a missing .sde gets the same note, so the file is never opened")
+        code, out = run([sde])
+        check(code == 1 and "[UNSUPPORTED]" in out and "stalehost" in out
+              and "invalid token" not in out,
+              "the command line names the file type and exits 1 as before")
+        check("hunter2" not in out,
+              "and no byte of the .sde reaches the report")
+        code, out = run([sde, "--json"])
+        check(code == 1 and "hunter2" not in out
+              and json.loads(out)["documents"][0]["notes"] == sde_doc.notes,
+              "--json carries the same note and none of the file")
+        check(find_documents(sdedir) == [],
+              "a tree walk still does not pick up .sde files")
+        code, out = run(["--diff", sde, lyrx])
+        check(code == 1 and "stalehost" in out and "Prod.sde" in out,
+              "--diff names an .sde given as the first document")
+        code, out = run(["--diff", lyrx, sde])
+        check(code == 1 and "stalehost" in out,
+              "and as the second document")
+
         # ---- argument handling
         args = _parse([workdir])
         check(args.check_network is False, "--check-network defaults to OFF")
@@ -1832,31 +1957,30 @@ def self_test():
         check(_parse([workdir, "--check-network"]).check_network is True,
               "--check-network is read")
         check(_parse([workdir, "--apply"]).apply is True, "--apply is read")
-        saved_err = sys.stderr
-        sys.stderr = io.StringIO()
-        try:
-            _parse([workdir, "--ap"])
-            refused = False
-        except SystemExit:
-            refused = True
-        finally:
-            sys.stderr = saved_err
-        check(refused, "a unique prefix of --apply is refused by the parser"
+        def prefix_refused(flag):
+            saved = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                _parse([workdir, flag])
+            except SystemExit:
+                return True
+            finally:
+                sys.stderr = saved
+            return False
+        check(prefix_refused("--ap"),
+              "a unique prefix of --apply is refused by the parser"
               "  <-- pinned defect")
+        check(all(prefix_refused(f) for f in ("--a", "--appl", "--check")),
+              "no shorter spelling of --apply or --check-network is accepted"
+              "  <-- pinned defect")
+        check(not prefix_refused("--apply") and not prefix_refused("--json"),
+              "the full flag names still parse")
         check(_parse(["--diff", "a.lyrx", "b.lyrx"]).diff == ["a.lyrx", "b.lyrx"],
               "--diff takes exactly two documents")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-    print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for label in failed:
-            print("  FAILED: %s" % label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    return tally.finish()
 
 
 # ----------------------------------------------------------------------- cli
@@ -1904,6 +2028,11 @@ def _run_diff(args):
             return 2
     documents = []
     for path in args.diff:
+        named = not_cim_note(path)
+        if named:
+            print("error: %s is %s: %s" % (path, UNSUPPORTED, named),
+                  file=sys.stderr)
+            return 1
         try:
             handle = open(path, "rb")
             try:

@@ -44,9 +44,12 @@ PASS  an unreadable directory reaches exit 1, as UNSUPPORTED does
 PASS  --filter drops a layer that does not match
 PASS  --apply authorises that same stat, which is all --apply does
 PASS  --diff --json emits the same three changes as data
+PASS  its note names stalehost instead of an XML parse error  <-- pinned defect
+PASS  the command line names the file type and exits 1 as before
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
+PASS  no shorter spelling of --apply or --check-network is accepted  <-- pinned defect
 --------------------------------------------------------------------
-206 assertions, 0 failed
+224 assertions, 0 failed
 ```
 
 ## Requirements
@@ -79,7 +82,7 @@ python cimscan.py --diff before.lyrx after.lyrx
 
 | Flag | Default | What it does |
 |---|---|---|
-| `root` | none | Folder to walk, or one document. Required unless `--diff` or `--self-test`. |
+| `root` | none | Folder to walk, or one document. Required unless `--diff` or `--self-test`. An `.sde` is named and refused, see below. |
 | `--filter` | none | Report only sources whose workspace, path, dataset or layer name contains this text. |
 | `--json` | off | Emit the scan as JSON instead of the text report. |
 | `--diff BEFORE AFTER` | none | Compare two layer documents semantically instead of scanning a tree. |
@@ -196,6 +199,43 @@ separated property, so properties are split on `&` as well. The key and every ot
 kept: only the value goes. Redacting the workspace also means a scan of a shared drive can be
 committed or pasted into a ticket, which is the only reason a report like this gets shared.
 
+## An .sde on the command line
+
+An `.sde` is not a CIM document. Esri's Create Database Connection tool describes its output as "a
+file that ArcGIS uses to connect to a database, a cloud data warehouse, or an enterprise
+geodatabase", and says "the output file will have the .sde extension"
+([Esri documentation](https://pro.arcgis.com/en/pro-app/3.5/tool-reference/data-management/create-database-connection.htm)).
+Until this change, an `.sde` handed to `cimscan` went to the XML parser and came back as
+`part Prod.sde did not parse: not well-formed (invalid token)`. That was true, and it told the
+reader nothing about what they had passed in. Now the report names the file type and the tool that
+does read it:
+
+```
+$ python cimscan.py Prod.sde
+== Prod.sde  [UNSUPPORTED]
+   ! an .sde is an ArcGIS database connection file, not a CIM document, so cimscan does not open it. To find a stale host in .sde files, use stalehost: https://github.com/uhsear/stalehost
+   (no data sources read)
+
+workspaces: 0 source(s) across 0 workspace(s)
+
+1 document(s), 0 OK, 1 UNSUPPORTED, 0 source(s), 0 missing, 0 unreadable directory(s)
+```
+
+The status, the count and the exit code are the ones the old message had: `UNSUPPORTED`, and exit 1.
+`--json` carries the same text in `notes`, and `--diff` prints it for either document:
+
+```
+$ python cimscan.py --diff Prod.sde Prod.sde
+error: Prod.sde is UNSUPPORTED: an .sde is an ArcGIS database connection file, not a CIM document, so cimscan does not open it. To find a stale host in .sde files, use stalehost: https://github.com/uhsear/stalehost
+```
+
+The decision is made on the extension, before the file is opened. An `.sde` can hold a saved user
+name and password (the same page says the tool saves them "in the connection file" when that box is
+checked, which is the default), so no byte of it is read and none can reach the report. The
+self-test pins this with an `.sde` that does not exist: it gets the same note as one that does, which
+only holds if nothing was opened. A directory walk still ignores `.sde` files, as before. The note
+appears only when you name the file yourself.
+
 ## The .lyrx diff
 
 A `.lyrx` is a whole JSON document for one layer. The three real ones on this machine are 986 lines
@@ -290,6 +330,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
   never reached, so one line can stand for a whole branch of the tree.
 - Row counts, field lists and spatial references are out of scope. This answers "what does it point
   at", not "what is in it".
+- Only `.sde` is named. The same Esri page gives "`.sde` or `.dbconn`" as the output of the
+  Python tool, so `.dbconn` is a second connection file type. `cimscan` has no rule for it and stalehost is not documented to
+  read it, so it gets the old parse error rather than a pointer that might be wrong.
+- Coverage of the module is 100 percent branch with the two hosts together, and 99 percent on each
+  alone. `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch
+  for Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines and Linux never
+  runs the `icacls` ones. Both hosts print the same assertion count, 224.
 - A layer name holding characters the console codepage cannot encode prints as `?`. The scan
   finishes; `--json` written to a file keeps the real name.
 
