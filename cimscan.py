@@ -17,13 +17,14 @@ directly, so it runs on the server, in a scheduled task, or in CI, on a bare
 python3. It knows less than arcpy does. It runs where arcpy cannot.
 
     python cimscan.py --self-test
-    python cimscan.py \\\\gis-fs\\projects
-    python cimscan.py \\\\gis-fs\\projects --filter sde:sqlserver:gisdb01
-    python cimscan.py \\\\gis-fs\\projects --json > sources.json
+    python cimscan.py \\\\fileserver\\projects
+    python cimscan.py \\\\fileserver\\projects --filter sde:sqlserver:dbhost1
+    python cimscan.py \\\\fileserver\\projects --json > sources.json
     python cimscan.py --diff before.lyrx after.lyrx
 
-Exit codes: 0 every document parsed, 1 at least one UNSUPPORTED, 2 the scan path
-could not be read, 64 usage error.
+Exit codes: 0 every document parsed and every folder listed, 1 at least one
+UNSUPPORTED document or unlistable folder, 2 the scan path does not exist, 64
+usage error.
 """
 
 from __future__ import print_function
@@ -32,6 +33,7 @@ import argparse
 import json
 import ntpath
 import os
+import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -66,8 +68,8 @@ REDACTION = "***REDACTED***"
 # SECRET and the API key spellings are here because a portal or feature service
 # connection stores its credential under one of those names, and a token in a
 # ticket is as usable as a password until it expires.
-SECRET_KEY_MARKERS = ("PASSWORD", "TOKEN", "SECRET", "APIKEY", "API_KEY",
-                      "CREDENTIAL")
+SECRET_KEY_MARKERS = ("PASSWORD", "PASSWD", "PWD", "TOKEN", "SECRET", "APIKEY",
+                      "API_KEY", "CREDENTIAL")
 
 # The part name given to a document that holds its layer at the root instead of
 # in a definitions array. Any name that no CIMPATH can spell would do; this one
@@ -233,6 +235,46 @@ def parse_properties(text):
     return props
 
 
+# A secret-bearing NAME=value pair anywhere inside a chunk: after "?", after
+# "&", after another "=" (CUSTOMPARAMETERS=token=...) or at the start. The
+# value stops at the next separator.
+_SECRET_PAIR = re.compile(
+    r"([^\s=&;?#]*(?:%s)[^\s=&;?#]*)=([^&;?#]*)"
+    % "|".join(re.escape(m) for m in SECRET_KEY_MARKERS), re.IGNORECASE)
+
+# scheme://user:password@host, the one credential spelling with no "=" in it.
+_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/:@\s;?#]*):[^/@\s;?#]*@")
+
+# A property name, as opposed to the front of a URL that holds a "?token=" key.
+_PLAIN_KEY = re.compile(r"^[\w .-]*$")
+
+# Any URL scheme. At least two characters, so a drive letter is not one.
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]+://")
+
+
+def _split_properties(text):
+    """Split a connection string on ";", except inside a quoted value.
+
+    A quote opens only straight after "=", so an apostrophe in a path does not
+    swallow the rest of the string. An unclosed quote runs to the end, which
+    over-redacts and never leaks.
+    """
+    chunks, current, quote = [], [], None
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'" and index and text[index - 1] == "=":
+            quote = char
+        elif char == ";":
+            chunks.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    chunks.append("".join(current))
+    return chunks
+
+
 def redact(text):
     """Replace every secret-bearing value in a connection string.
 
@@ -242,23 +284,34 @@ def redact(text):
     chat log and a CI artefact. Redaction happens where the Source is built, so
     one call covers every output mode instead of each formatter remembering.
 
-    Properties are split on ";" and again on "&", because a service workspace is
-    a URL and a stored token sits in its query string. Splitting on ";" alone
-    left "?token=..." inside a chunk whose key did not match, and printed the
-    token. Both separators go back exactly as they were found, so a string with
-    nothing to redact comes out unchanged.
+    The string is split into properties on ";" outside quotes. A property whose
+    key holds a secret marker loses its whole value, "&" and "?" included, since
+    a password may contain either. A chunk with no "=" straight after such a
+    property is the rest of a password that held a ";", so it goes too. Every
+    other property is searched for NAME=value pairs with a secret name, which
+    finds a token in a service URL query string and one inside
+    CUSTOMPARAMETERS=token=..., and for scheme://user:password@host. A string
+    with nothing to redact comes out unchanged.
     """
-    if not text or "=" not in text:
-        return text or ""
-
-    def one(chunk):
+    if not text:
+        return ""
+    out = []
+    swallowing = False
+    for chunk in _split_properties(text):
         key, sep, _value = chunk.partition("=")
-        if sep and any(m in key.strip().upper() for m in SECRET_KEY_MARKERS):
-            return "%s=%s" % (key, REDACTION)
-        return chunk
-
-    return ";".join("&".join(one(p) for p in part.split("&"))
-                    for part in text.split(";"))
+        if sep and _PLAIN_KEY.match(key) and any(
+                m in key.upper() for m in SECRET_KEY_MARKERS):
+            out.append("%s=%s" % (key, REDACTION))
+            swallowing = True
+        elif swallowing and not sep and chunk.strip():
+            continue
+        else:
+            swallowing = False
+            chunk = _USERINFO.sub(lambda m: m.group(1) + ":" + REDACTION + "@",
+                                  chunk)
+            out.append(_SECRET_PAIR.sub(
+                lambda m: m.group(1) + "=" + REDACTION, chunk))
+    return ";".join(out)
 
 
 def connection_facts(connection):
@@ -294,15 +347,17 @@ def workspace_path(workspace):
 
     A remote geodatabase carries a DATABASE property too, and there it is the
     name of a database on a server rather than a path. Treating it as a path
-    reports every SDE layer in the county as MISSING, and the report becomes
+    reports every SDE layer on the server as MISSING, and the report becomes
     noise that nobody reads.
     """
     workspace = (workspace or "").strip()
     if not workspace:
         return None
+    # A URL of any scheme names a service, not a folder. Returning it as a path
+    # would also copy a user:password@ into the path field, which is not redacted.
+    if _SCHEME.match(workspace):
+        return None
     if "=" not in workspace:
-        if workspace.lower().startswith(("http://", "https://")):
-            return None
         return workspace
     props = parse_properties(workspace)
     if "SERVER" in props or "INSTANCE" in props:
@@ -329,9 +384,8 @@ def is_windows_absolute(path):
 def resolve(path, home, isabs=os.path.isabs):
     r"""Resolve a workspace path against the project home directory.
 
-    Pro saves relative paths by default, so a workspace of
-    "DATABASE=..\commondata\parcels.gdb" is normal and means nothing until you
-    know which document it came out of.
+    A workspace of "DATABASE=..\commondata\parcels.gdb" is relative to the
+    document, so it means nothing until you know which document it came out of.
 
     A Windows-absolute path is returned in Windows form on every host. It names
     a location on a Windows machine, and rewriting its separators to suit the
@@ -359,14 +413,21 @@ def is_network_path(path):
     return path.startswith("\\\\") or path.startswith("//")
 
 
-def check_presence(path, check_network, exists=os.path.exists):
+def check_presence(path, check_network, exists=os.path.exists,
+                   windows=os.name == "nt"):
     """Presence for a resolved path: True, False, or None when not checked.
+
+    A Windows path (drive letter or UNC) read on a POSIX host cannot be
+    evaluated there: os.path.exists is always False for it, so every such layer
+    came out MISSING on the file server. The honest verdict is unknown.
 
     A UNC stat against a server that is already switched off blocks for the full
     SMB timeout. Three hundred layers pointed at a decommissioned box turn a
     scan into an afternoon, so the network check is opt in.
     """
     if path is None:
+        return None
+    if not windows and (is_windows_absolute(path) or path[1:2] == ":"):
         return None
     if is_network_path(path) and not check_network:
         return None
@@ -382,6 +443,15 @@ def not_cim_note(path):
     credential and none of its bytes are needed to name it.
     """
     return NOT_CIM.get(os.path.splitext(path or "")[1].lower())
+
+
+def is_cim_root(root):
+    """True for a decoded document whose root object names a CIM type.
+
+    Valid JSON is not a CIM document. A settings file renamed .lyrx parses,
+    holds no layers, and reads as a project with nothing to report.
+    """
+    return isinstance(root, dict) and str(root.get("type", "")).startswith("CIM")
 
 
 def find_connection(node):
@@ -404,6 +474,27 @@ def find_connection(node):
             if found is not None:
                 return found
     return None
+
+
+def leaf_connections(connection):
+    """The connections that name a real source, descending through a join.
+
+    A joined layer is a CIMRelQueryTableDataConnection that holds no workspace
+    of its own. Its sourceTable and destinationTable are the data connections
+    (Esri cim-spec, CIMVectorLayers.md). Reporting only the wrapper printed the
+    layer as "no workspace" and hid the server a --filter was looking for. A
+    connection with no connection nested inside it is its own leaf, and None
+    (a layer with no connection found) is returned as it came.
+    """
+    if not isinstance(connection, dict):
+        return [connection]
+    leaves = []
+    for key in sorted(connection):
+        for value in as_list(connection[key]):
+            if isinstance(value, dict) and "connection" in str(
+                    value.get("type", "")).lower():
+                leaves.extend(leaf_connections(value))
+    return leaves or [connection]
 
 
 def _reference_name(text):
@@ -555,19 +646,20 @@ def collect_sources(document, parts, roots, home, check_network,
         connection = find_connection(node)
         if connection is None:
             continue
-        kind, workspace, dataset, dataset_type = connection_facts(connection)
-        path = resolve(workspace_path(workspace), home)
-        sources.append(Source(
-            document=document,
-            container=container or "(no map)",
-            layer=name,
-            kind=kind,
-            dataset=dataset,
-            dataset_type=dataset_type,
-            workspace=redact(workspace),
-            path=path,
-            present=check_presence(path, check_network, exists),
-        ))
+        for leaf in leaf_connections(connection):
+            kind, workspace, dataset, dataset_type = connection_facts(leaf)
+            path = resolve(workspace_path(workspace), home)
+            sources.append(Source(
+                document=document,
+                container=container or "(no map)",
+                layer=name,
+                kind=kind,
+                dataset=dataset,
+                dataset_type=dataset_type,
+                workspace=redact(workspace),
+                path=path,
+                present=check_presence(path, check_network, exists),
+            ))
     return sources
 
 
@@ -612,7 +704,11 @@ def matches_filter(source, text):
 
 def layer_signature(node):
     """The four things a .lyrx pull request is actually about."""
-    kind, workspace, dataset, _type = connection_facts(find_connection(node))
+    outer = find_connection(node)
+    kind = connection_facts(outer)[0]
+    source = " + ".join(
+        "%s|%s" % (redact(w), d) for _k, w, d, _t in
+        (connection_facts(leaf) for leaf in leaf_connections(outer)))
     feature_table = node.get("featuretable")
     query = ""
     if isinstance(feature_table, dict):
@@ -624,7 +720,7 @@ def layer_signature(node):
         if not field:
             field = ", ".join(str(f) for f in as_list(renderer.get("fields")))
     return {
-        "source": "%s|%s" % (redact(workspace), dataset),
+        "source": source,
         "connection": kind,
         "definitionQuery": query,
         "rendererField": field,
@@ -634,8 +730,8 @@ def layer_signature(node):
 def diff_documents(before, after):
     """Semantic differences between two parsed layer documents.
 
-    A .lyrx is a whole JSON document for one layer, and the real ones on this
-    machine run to 986 lines each. Re-saving one in Pro rewrites its uri, so a
+    A .lyrx is a whole JSON document for one layer, and a real one
+    runs to hundreds of lines. Re-saving one in Pro rewrites its uri, so a
     textual diff reports a change even when nothing a reviewer cares about
     moved. These four fields are what the review is actually about.
     """
@@ -643,8 +739,13 @@ def diff_documents(before, after):
         parts, roots = document_parts(root)
         layers, _visited = walk_layers(parts, roots)
         out = {}
+        seen = {}
         for _container, name, node in layers:
-            out[name] = layer_signature(node)
+            # Two layers may share a name. Keyed on the name alone, the later
+            # one overwrote the earlier and a repoint of the first vanished.
+            seen[name] = seen.get(name, 0) + 1
+            key = name if seen[name] == 1 else "%s (#%d)" % (name, seen[name])
+            out[key] = layer_signature(node)
         return out
 
     old, new = summaries(before), summaries(after)
@@ -714,8 +815,7 @@ def scan_document(path, check_network=False, exists=os.path.exists):
         # Valid JSON is not the same thing as a CIM document. A settings file
         # renamed .lyrx parses, holds no layers, and used to be reported OK with
         # no sources, which reads exactly like a project with nothing broken.
-        if not isinstance(root, dict) or not str(
-                root.get("type", "")).startswith("CIM"):
+        if not is_cim_root(root):
             notes.append("the root object is not a CIM document")
         parts, roots = document_parts(root)
     else:
@@ -852,7 +952,7 @@ def diff_lines(changes):
 FIXTURE_NS = ('xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
               'xmlns:typens="http://www.esri.com/schemas/ArcGIS/2.9.0"')
 
-FIXTURE_SDE = ("SERVER=gisdb01;INSTANCE=sde:sqlserver:gisdb01;DATABASE=sdeprod;"
+FIXTURE_SDE = ("SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=gisdata;"
                "USER=viewer;PASSWORD=hunter2;AUTHENTICATION_MODE=DBMS")
 
 FIXTURE_GDB = "DATABASE=..\\commondata\\parcels.gdb"
@@ -864,9 +964,9 @@ FIXTURE_GDB = "DATABASE=..\\commondata\\parcels.gdb"
 FIXTURE_SDE_REAL = (
     "ENCRYPTED_PASSWORD=00022e6844ca3f1ab7d59c0e18a5;"
     "ENCRYPTED_PASSWORD_UTF8=00022e68e1f40c7b25d3;"
-    "SERVER=gisdb01;INSTANCE=sde:sqlserver:gisdb01\\SQLEXPRESS;"
-    "DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=gisdb01\\SQLEXPRESS;"
-    "DATABASE=sdeprod;USER=gis_viewer;AUTHENTICATION_MODE=DBMS;"
+    "SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1\\SQLEXPRESS;"
+    "DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=dbhost1\\SQLEXPRESS;"
+    "DATABASE=gisdata;USER=viewer_acct;AUTHENTICATION_MODE=DBMS;"
     "BRANCH=sde.DEFAULT;VERSION=sde.DEFAULT")
 
 
@@ -976,7 +1076,7 @@ def _deny_read(path):
     return lambda: os.chmod(path, 0o700)
 
 
-def _fixture_lyrx(dataset, query, field, name="ACLED"):
+def _fixture_lyrx(dataset, query, field, name="Events"):
     """Bare CIM JSON on disk, the shape a real .lyrx has. Not zipped."""
     return json.dumps({
         "type": "CIMLayerDocument",
@@ -991,7 +1091,7 @@ def _fixture_lyrx(dataset, query, field, name="ACLED"):
                 "definitionExpression": query,
                 "dataConnection": {
                     "type": "CIMStandardDataConnection",
-                    "workspaceConnectionString": "DATABASE=..\\conflict.gdb",
+                    "workspaceConnectionString": "DATABASE=..\\events.gdb",
                     "workspaceFactory": "FileGDB",
                     "dataset": dataset,
                     "datasetType": "esriDTFeatureClass",
@@ -1006,7 +1106,7 @@ def _fixture_mapx():
     """A .mapx: CIM JSON whose map is one object, not an array.
 
     Written the way the CIM serialiser writes it, including the "uRI" spelling a
-    real .lyrx on this machine uses, and a standalone table the map holds by
+    saved .lyrx uses, and a standalone table the map holds by
     reference. Both are what a .mapx has and a .lyrx does not.
     """
     return json.dumps({
@@ -1089,6 +1189,36 @@ def _fixture_pagx():
     })
 
 
+def _fixture_std(workspace, dataset):
+    return {"type": "CIMStandardDataConnection",
+            "workspaceConnectionString": workspace,
+            "workspaceFactory": "FileGDB", "dataset": dataset,
+            "datasetType": "esriDTTable"}
+
+
+def _fixture_layers_lyrx(layers):
+    """A .lyrx holding several layers, each given as (name, connection)."""
+    definitions = []
+    for index, (name, connection) in enumerate(layers):
+        definitions.append({
+            "type": "CIMFeatureLayer", "name": name,
+            "uri": "CIMPATH=l%d.json" % index,
+            "featureTable": {"type": "CIMFeatureTable",
+                             "dataConnection": connection}})
+    return json.dumps({
+        "type": "CIMLayerDocument",
+        "layers": [d["uri"] for d in definitions],
+        "layerDefinitions": definitions})
+
+
+def _fixture_join(destination):
+    """A joined layer: a RelQuery wrapper with its two tables nested inside."""
+    return {"type": "CIMRelQueryTableDataConnection",
+            "sourceTable": _fixture_std(FIXTURE_GDB, "Parcels"),
+            "destinationTable": _fixture_std(destination, "GIS.Owners"),
+            "primaryKey": "PIN", "foreignKey": "PIN"}
+
+
 class _Tally(object):
     """The self-test's check()/raises() harness and its footer.
 
@@ -1165,7 +1295,7 @@ def self_test():
               "a stored password never survives redaction")
         check(REDACTION in redact(FIXTURE_SDE),
               "the redaction marker takes its place")
-        check("SERVER=gisdb01" in redact(FIXTURE_SDE),
+        check("SERVER=dbhost1" in redact(FIXTURE_SDE),
               "the server name is kept, it is the whole point of the scan")
         check("USER=viewer" in redact(FIXTURE_SDE), "the user name is kept")
         check(REDACTION in redact("ENCRYPTED_PASSWORD=abc123"),
@@ -1197,12 +1327,12 @@ def self_test():
               "neither stored password blob survives a real .sde connection")
         check(real.count(REDACTION) == 2,
               "ENCRYPTED_PASSWORD and ENCRYPTED_PASSWORD_UTF8 both go")
-        check("INSTANCE=sde:sqlserver:gisdb01\\SQLEXPRESS" in real,
+        check("INSTANCE=sde:sqlserver:dbhost1\\SQLEXPRESS" in real,
               "the instance, which is what a decommissioning plan needs, stays")
-        check("USER=gis_viewer" in real and "VERSION=sde.DEFAULT" in real,
+        check("USER=viewer_acct" in real and "VERSION=sde.DEFAULT" in real,
               "the user and the version survive redaction")
         real_props = parse_properties(FIXTURE_SDE_REAL)
-        check(real_props["INSTANCE"] == "sde:sqlserver:gisdb01\\SQLEXPRESS",
+        check(real_props["INSTANCE"] == "sde:sqlserver:dbhost1\\SQLEXPRESS",
               "a named instance keeps the backslash and the instance name")
         check(real_props["AUTHENTICATION_MODE"] == "DBMS",
               "the authentication mode is read from the same property set")
@@ -1213,8 +1343,8 @@ def self_test():
 
         # ---- connection string properties
         props = parse_properties(FIXTURE_SDE)
-        check(props["SERVER"] == "gisdb01", "the server property is read")
-        check(props["DATABASE"] == "sdeprod", "the database property is read")
+        check(props["SERVER"] == "dbhost1", "the server property is read")
+        check(props["DATABASE"] == "gisdata", "the database property is read")
         check(parse_properties("") == {}, "an empty string yields no properties")
 
         # ---- which workspaces are paths at all
@@ -1222,7 +1352,7 @@ def self_test():
               "a file geodatabase workspace is a path")
         check(workspace_path(FIXTURE_SDE) is None,
               "a remote DATABASE is a database name, not a path")
-        check(workspace_path("INSTANCE=sde:oracle11g:gisdb;DATABASE=sdeprod;"
+        check(workspace_path("INSTANCE=sde:oracle11g:gisdb;DATABASE=gisdata;"
                              "USER=viewer") is None,
               "a direct connect names an INSTANCE and no SERVER, and its "
               "DATABASE is still not a folder")
@@ -1246,10 +1376,11 @@ def self_test():
               "a resolved path that is not there is missing")
         check(check_presence(home, False) is True,
               "a path that is there is present")
-        check(check_presence("\\\\deadserver\\gis\\x.gdb", False) is None,
+        check(check_presence("\\\\deadserver\\gis\\x.gdb", False,
+                             windows=True) is None,
               "a UNC path is left unchecked by default, a dead server hangs the stat")
         check(check_presence("\\\\deadserver\\gis\\x.gdb", True,
-                             exists=lambda p: False) is False,
+                             exists=lambda p: False, windows=True) is False,
               "--check-network turns the UNC stat on")
         check(resolve("C:\\gis\\x.gdb", home) == "C:\\gis\\x.gdb",
               "an absolute workspace path ignores the project home")
@@ -1268,13 +1399,13 @@ def self_test():
               "a bare drive letter with no separator is not a path")
         check(is_windows_absolute("") is False,
               "an empty path is not windows absolute")
-        check(is_network_path("\\\\gis-fs\\projects\\x.gdb") is True,
+        check(is_network_path("\\\\fileserver\\projects\\x.gdb") is True,
               "a UNC path is a network path")
         check(is_network_path("C:\\gis\\x.gdb") is False,
               "a local drive path is not")
         check(is_network_path("") is False,
               "and an empty path is not one either")
-        check(is_network_path("//gis-fs/projects/x.gdb") is True,
+        check(is_network_path("//fileserver/projects/x.gdb") is True,
               "a UNC path written with forward slashes is one too")
         check(resolve("C:parcels.gdb", home) == "C:parcels.gdb",
               "a drive-relative workspace is not joined onto the project home")
@@ -1287,7 +1418,7 @@ def self_test():
 
         # ---- THE PINNED DEFECT: two serialisations of one object model
         xml_node = parse_cim(_fixture_layer_xml("L", "Parcels", "DATABASE=x.gdb"))
-        json_node = parse_cim(_fixture_lyrx("ACLED_2005_2018", "", "FATALITIES"))
+        json_node = parse_cim(_fixture_lyrx("Events_2005_2018", "", "FATALITIES"))
         check(xml_node["type"] == "CIMFeatureLayer",
               "an .aprx part is CIM XML and parses  <-- pinned defect")
         check(json_node["type"] == "CIMLayerDocument",
@@ -1295,7 +1426,7 @@ def self_test():
         check(find_connection(xml_node)["dataset"] == "Parcels",
               "the XML spelling DataConnection is found")
         check(find_connection(json_node["layerdefinitions"][0])["dataset"]
-              == "ACLED_2005_2018",
+              == "Events_2005_2018",
               "the JSON spelling dataConnection is found by the same code")
         check(parse_cim('<A xsi:type="typens:ArrayOfString" '
                         'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"/>')
@@ -1406,7 +1537,7 @@ def self_test():
         # ---- workspace grouping, the plan rows
         groups = group_by_workspace(document.sources)
         check(len(groups) == 2, "seven sources collapse onto two workspaces")
-        sde_group = [g for g in groups if "gisdb01" in g["workspace"]][0]
+        sde_group = [g for g in groups if "dbhost1" in g["workspace"]][0]
         check(sde_group["count"] == 5,
               "four zoning layers and one query layer share a single .sde row")
         check(sde_group["state"] == UNKNOWN,
@@ -1529,7 +1660,7 @@ def self_test():
 
         # ---- filtering
         check(matches_filter(buried, "parcels"), "--filter matches a dataset name")
-        check(matches_filter(by_layer["Zoning A"], "sde:sqlserver:gisdb01"),
+        check(matches_filter(by_layer["Zoning A"], "sde:sqlserver:dbhost1"),
               "--filter matches a server inside the connection string")
         check(not matches_filter(buried, "oracle"), "--filter rejects a miss")
         check(matches_filter(buried, None), "no --filter matches everything")
@@ -1653,7 +1784,7 @@ def self_test():
               "<-- pinned defect")
 
         # ---- the --json payload
-        payload = json_report([document, result], "gisdb01", root=workdir)
+        payload = json_report([document, result], "dbhost1", root=workdir)
         shown = [s["layer"] for d in payload["documents"] for s in d["sources"]]
         check(len(shown) == 5,
               "--json is filtered like the text report, not left unfiltered")
@@ -1689,18 +1820,18 @@ def self_test():
               "the scan  <-- pinned defect")
 
         # ---- the .lyrx path end to end, and the semantic diff
-        lyrx = os.path.join(home, "Conflict.lyrx")
+        lyrx = os.path.join(home, "Events.lyrx")
         handle = open(lyrx, "w")
-        handle.write(_fixture_lyrx("ACLED_2005_2018", "YEAR >= 2010", "FATALITIES"))
+        handle.write(_fixture_lyrx("Events_2005_2018", "YEAR >= 2010", "FATALITIES"))
         handle.close()
         lyrx_doc = scan_document(lyrx)
         check(lyrx_doc.status == OK, "an unzipped .lyrx scans OK")
-        check(lyrx_doc.sources[0].dataset == "ACLED_2005_2018",
+        check(lyrx_doc.sources[0].dataset == "Events_2005_2018",
               "the .lyrx source is read without any zip involved")
 
-        before = parse_cim(_fixture_lyrx("ACLED_2005_2018", "YEAR >= 2010",
+        before = parse_cim(_fixture_lyrx("Events_2005_2018", "YEAR >= 2010",
                                          "FATALITIES"))
-        after = parse_cim(_fixture_lyrx("ACLED_2019_2024", "YEAR >= 2019",
+        after = parse_cim(_fixture_lyrx("Events_2019_2024", "YEAR >= 2019",
                                         "EVENTS"))
         kinds = [c[0] for c in diff_documents(before, after)]
         check("source repointed" in kinds, "the diff reports a repointed source")
@@ -1711,7 +1842,7 @@ def self_test():
         check(len(kinds) == 3, "an unchanged field is not reported")
         check(diff_documents(before, before) == [],
               "a document diffed against itself reports nothing")
-        renamed = parse_cim(_fixture_lyrx("ACLED_2005_2018", "YEAR >= 2010",
+        renamed = parse_cim(_fixture_lyrx("Events_2005_2018", "YEAR >= 2010",
                                           "FATALITIES", name="Renamed"))
         kinds = [c[0] for c in diff_documents(before, renamed)]
         check("layer removed" in kinds and "layer added" in kinds,
@@ -1719,9 +1850,9 @@ def self_test():
         rendered = diff_lines(diff_documents(before, renamed))
         check(rendered[-1] == "2 change(s)",
               "the rendered diff counts the changes it printed")
-        check("layer removed: ACLED" in rendered,
+        check("layer removed: Events" in rendered,
               "the removed layer is named")
-        check("   before: ACLED" in rendered,
+        check("   before: Events" in rendered,
               "a removal prints a before side and no after side")
         check("   after:  Renamed" in rendered,
               "an addition prints an after side and no before side")
@@ -1778,11 +1909,11 @@ def self_test():
               "the report names the .mapx and the .pagx it scanned")
         check("6 OK, 6 UNSUPPORTED" in out,
               "the footer separates the readable documents from the rest")
-        code, out = run([home, "--filter", "gisdb01"])
+        code, out = run([home, "--filter", "dbhost1"])
         check("Zoning A" in out, "--filter keeps a layer on the matched server")
         check("Buried Parcels" not in out,
               "--filter drops a layer that does not match")
-        check("Conflict.lyrx" not in out,
+        check("Events.lyrx" not in out,
               "a document whose every source the filter rejected stays quiet")
         check("Notes.lyrx" in out,
               "an UNSUPPORTED document is printed whatever the filter says")
@@ -1816,11 +1947,13 @@ def self_test():
         code, out = run([unc])
         check(code == 0 and UNKNOWN in out and MISSING not in out,
               "a UNC source is unknown while the network check is off")
+        # A POSIX host cannot evaluate a Windows path, so there the flag changes
+        # nothing and the verdict stays unknown. One assertion, both hosts.
         code, out = run([unc, "--check-network"])
-        check(code == 0 and MISSING in out,
-              "--check-network stats it for real and calls it MISSING")
+        check(code == 0 and (MISSING in out) == (os.name == "nt"),
+              "--check-network stats it for real on Windows, MISSING there")
         code, out = run([unc, "--apply"])
-        check(code == 0 and MISSING in out,
+        check(code == 0 and (MISSING in out) == (os.name == "nt"),
               "--apply authorises that same stat, which is all --apply does")
         code, out = run([mapx, "--apply"])
         check(code == 0 and "Owner Lookup" in out,
@@ -1848,13 +1981,13 @@ def self_test():
         check(code == 0 and "Roads" in out,
               "and the walk hands it to the scanner like any other")
 
-        repointed = os.path.join(home, "Conflict2.lyrx")
+        repointed = os.path.join(home, "Events2.lyrx")
         handle = open(repointed, "w")
-        handle.write(_fixture_lyrx("ACLED_2019_2024", "YEAR >= 2019", "EVENTS"))
+        handle.write(_fixture_lyrx("Events_2019_2024", "YEAR >= 2019", "EVENTS"))
         handle.close()
         code, out = run(["--diff", lyrx, repointed])
         check(code == 0, "--diff on two readable documents exits 0")
-        check("definition query changed: ACLED" in out and "3 change(s)" in out,
+        check("definition query changed: Events" in out and "3 change(s)" in out,
               "--diff prints the three fields that moved")
         code, out = run(["--diff", lyrx, repointed, "--json"])
         check([c["change"] for c in json.loads(out)] ==
@@ -1911,7 +2044,7 @@ def self_test():
         os.makedirs(sdedir)
         sde = os.path.join(sdedir, "Prod.sde")
         handle = open(sde, "wb")
-        handle.write(b"\x00\x01SERVER=gisdb01;PASSWORD=hunter2\xff")
+        handle.write(b"\x00\x01SERVER=dbhost1;PASSWORD=hunter2\xff")
         handle.close()
         sde_doc = scan_document(sde)
         check(sde_doc.status == UNSUPPORTED and sde_doc.sources == [],
@@ -1942,6 +2075,174 @@ def self_test():
         check(code == 1 and "stalehost" in out,
               "and as the second document")
 
+        # ---- credentials in the shapes the first pass missed
+        amp = redact("USER=a;PASSWORD=Summer&Winter1;SERVER=h")
+        check("Winter1" not in amp and amp.endswith(";SERVER=h"),
+              "a password holding an ampersand is redacted whole  "
+              "<-- pinned defect")
+        semi = redact("PASSWORD=ab;cd9;SERVER=h")
+        check("cd9" not in semi and semi.endswith(";SERVER=h"),
+              "a password holding a semicolon loses its tail too  "
+              "<-- pinned defect")
+        quoted = redact('PASSWORD="ab;cd=9";SERVER=h')
+        check("cd=9" not in quoted and quoted.endswith(";SERVER=h"),
+              "a quoted password holding a semicolon is one value  "
+              "<-- pinned defect")
+        check("cd9" not in redact('PASSWORD="ab;cd9'),
+              "an unclosed quote over-redacts instead of leaking")
+        apostrophe = redact("DATABASE=C:\\it's;PASSWORD=p;AUTH=1")
+        check(apostrophe == "DATABASE=C:\\it's;PASSWORD=%s;AUTH=1" % REDACTION,
+              "an apostrophe inside a path opens no quote")
+        check(redact("PASSWORD=x;") == "PASSWORD=%s;" % REDACTION,
+              "an empty chunk after a secret is kept, not swallowed")
+        url_key = redact("URL=https://h/x/FeatureServer?token=topsecretA&f=json")
+        check("topsecretA" not in url_key and url_key.endswith("&f=json")
+              and url_key.startswith("URL=https://h/"),
+              "a token in the query of a URL= property is redacted  "
+              "<-- pinned defect")
+        custom = redact("URL=https://h/x;CUSTOMPARAMETERS=token=topsecretC")
+        check("topsecretC" not in custom and custom.startswith("URL=https://h/x;"),
+              "a token inside CUSTOMPARAMETERS=token=... is redacted  "
+              "<-- pinned defect")
+        userinfo = redact("https://svcuser:Hunter9Secret@maps.example.org/x")
+        check("Hunter9Secret" not in userinfo and "svcuser" in userinfo
+              and userinfo.endswith("@maps.example.org/x"),
+              "a password in URL userinfo is redacted, the user kept  "
+              "<-- pinned defect")
+        check(all(REDACTION in redact(t) for t in
+                  ("PWD=a", "DB_PASSWD=a", "X=1;pwd=a")),
+              "PWD and PASSWD spellings are redacted, in any case")
+        ftp = "ftp://u:pw@host/x"
+        check(workspace_path(ftp) is None and "pw@" not in redact(ftp),
+              "a URL of any scheme is no folder, so its userinfo is not "
+              "copied into the path  <-- pinned defect")
+        check(workspace_path("C:\\data\\x.gdb") == "C:\\data\\x.gdb"
+              and workspace_path("//host/share/x.gdb") == "//host/share/x.gdb",
+              "a drive path and a UNC path are still paths, not schemes")
+
+        # ---- a joined layer reports the tables it joins
+        join_workspace = ("SERVER=olddb;INSTANCE=sde:sqlserver:olddb;"
+                          "DATABASE=gisdata")
+        joindir = os.path.join(workdir, "joins")
+        os.makedirs(joindir)
+        join_path = os.path.join(joindir, "Joined.lyrx")
+        handle = open(join_path, "w")
+        handle.write(_fixture_layers_lyrx(
+            [("Parcels joined", _fixture_join(join_workspace))]))
+        handle.close()
+        join_doc = scan_document(join_path)
+        check(len(join_doc.sources) == 2
+              and sorted(s.dataset for s in join_doc.sources)
+              == ["GIS.Owners", "Parcels"],
+              "a joined layer reports its source and destination tables  "
+              "<-- pinned defect")
+        check(any("olddb" in s.workspace for s in join_doc.sources),
+              "the server behind the join is in the report")
+        code, out = run([joindir, "--filter", "olddb"])
+        check(code == 0 and "1 source(s)" in out and "GIS.Owners" in out,
+              "--filter finds the server hidden behind a join  "
+              "<-- pinned defect")
+        bare = {"type": "CIMRelQueryTableDataConnection"}
+        check(leaf_connections(bare) == [bare] and leaf_connections(None)
+              == [None] and leaf_connections(_fixture_std("", "x"))[0]["dataset"]
+              == "x", "a connection with nothing nested is its own leaf")
+        as_pair = {"type": "CIMRelQueryTableDataConnection",
+                   "sourceTable": [_fixture_std("A", "a"), _fixture_std("B", "b")]}
+        check([c["dataset"] for c in leaf_connections(as_pair)] == ["a", "b"],
+              "a list of nested connections is read as a list")
+        join_after = os.path.join(joindir, "JoinedAfter.lyrx")
+        handle = open(join_after, "w")
+        handle.write(_fixture_layers_lyrx(
+            [("Parcels joined", _fixture_join("DATABASE=..\\owners.gdb"))]))
+        handle.close()
+        code, out = run(["--diff", join_path, join_after])
+        check(code == 0 and "source repointed: Parcels joined" in out,
+              "--diff sees a repoint of the joined table  <-- pinned defect")
+
+        # ---- --diff keeps two layers of one name apart
+        dup_a = os.path.join(joindir, "DupA.lyrx")
+        dup_b = os.path.join(joindir, "DupB.lyrx")
+        for target, first in ((dup_a, "DATABASE=a.gdb"),
+                              (dup_b, "DATABASE=z.gdb")):
+            handle = open(target, "w")
+            handle.write(_fixture_layers_lyrx([
+                ("Roads", _fixture_std(first, "R")),
+                ("Roads", _fixture_std("DATABASE=b.gdb", "R"))]))
+            handle.close()
+        code, out = run(["--diff", dup_a, dup_b])
+        check(code == 0 and "source repointed: Roads" in out
+              and "1 change(s)" in out and "(#2)" not in out,
+              "repointing the first of two same-named layers is reported  "
+              "<-- pinned defect")
+        code, out = run(["--diff", dup_a, dup_a])
+        check(code == 0 and "no semantic difference" in out,
+              "the same two same-named layers compare equal")
+
+        # ---- --diff refuses what the scan refuses
+        not_cim = []
+        for index, body in enumerate(('{"theme": "dark"}', '{}', '[1, 2]')):
+            target = os.path.join(joindir, "NotCim%d.lyrx" % index)
+            handle = open(target, "w")
+            handle.write(body)
+            handle.close()
+            not_cim.append(target)
+        code, out = run(["--diff", not_cim[0], not_cim[1]])
+        check(code == 1 and "not a CIM document" in out
+              and "no semantic difference" not in out,
+              "--diff of two JSON files that are not CIM exits 1  "
+              "<-- pinned defect")
+        code, out = run(["--diff", join_path, not_cim[2]])
+        check(code == 1 and "NotCim2.lyrx" in out,
+              "--diff names the second document when only it is not CIM")
+        check(is_cim_root({"type": "CIMLayerDocument"})
+              and not is_cim_root({}) and not is_cim_root([])
+              and not is_cim_root({"type": 5}),
+              "only a dict whose type starts with CIM is a CIM root")
+        code, out = run(["--diff", dup_a, dup_b, joindir])
+        check(code == 64 and "exactly two documents" in out
+              and "source repointed" not in out,
+              "--diff with a third argument is a usage error  "
+              "<-- pinned defect")
+
+        # ---- a Windows path read on a POSIX host is unknown, not MISSING
+        gone = lambda _p: False
+        check(check_presence("C:\\data\\x.gdb", False, gone, windows=False)
+              is None and check_presence("C:x.gdb", False, gone, windows=False)
+              is None,
+              "a drive path on a POSIX host is unknown, not MISSING  "
+              "<-- pinned defect")
+        check(check_presence("\\\\host\\share\\x.gdb", True, gone, windows=False)
+              is None,
+              "a UNC path on a POSIX host is unknown even with --check-network"
+              "  <-- pinned defect")
+        check(check_presence("C:\\data\\x.gdb", False, gone, windows=True)
+              is False and check_presence("/srv/x.gdb", False, gone,
+                                          windows=False) is False,
+              "a Windows host still stats its drive, and a POSIX host its own")
+        drive_path = os.path.join(joindir, "Drive.lyrx")
+        handle = open(drive_path, "w")
+        handle.write(_fixture_layers_lyrx(
+            [("Drive", _fixture_std("DATABASE=C:\\cimscan-no-such\\x.gdb", "x"))]))
+        handle.close()
+        check(scan_document(drive_path).sources[0].state
+              == (MISSING if os.name == "nt" else UNKNOWN),
+              "end to end, the verdict on a drive path depends on the host that "
+              "can evaluate it")
+
+        # ---- --json is JSON even when there is nothing to report
+        emptydir = os.path.join(workdir, "empty")
+        os.makedirs(emptydir)
+        code, out = run([emptydir, "--json"])
+        check(code == 0 and json.loads(out)["documents"] == [],
+              "--json on a folder with no documents is still JSON  "
+              "<-- pinned defect")
+        code, out = run([sdedir, "--json"])
+        check(code == 0 and json.loads(out)["workspaces"] == [],
+              "so is --json on a folder holding only .sde files")
+        code, out = run([emptydir])
+        check(code == 0 and "no .aprx" in out,
+              "without --json the sentence is unchanged")
+
         # ---- argument handling
         args = _parse([workdir])
         check(args.check_network is False, "--check-network defaults to OFF")
@@ -1952,7 +2253,7 @@ def self_test():
         check(args.root == workdir, "the scan root is read")
         check(_parse(["--self-test"]).self_test, "--self-test parses")
         check(_parse([workdir, "--json"]).json is True, "--json is read")
-        check(_parse([workdir, "--filter", "gisdb01"]).filter == "gisdb01",
+        check(_parse([workdir, "--filter", "dbhost1"]).filter == "dbhost1",
               "--filter is read")
         check(_parse([workdir, "--check-network"]).check_network is True,
               "--check-network is read")
@@ -1994,7 +2295,9 @@ def _parse(argv):
                     "an unreadable project a clean one.",
         epilog="cimscan never writes to a document. The only outbound action is "
                "checking whether a UNC path exists, and that is off until "
-               "--apply or --check-network is passed.",
+               "--apply or --check-network is passed. The share host comes "
+               "from the document, so use those flags only on documents you "
+               "trust.",
     )
     parser.add_argument("root", nargs="?",
                         help="folder to walk, or a single document")
@@ -2036,9 +2339,12 @@ def _run_diff(args):
         try:
             handle = open(path, "rb")
             try:
-                documents.append(parse_cim(handle.read()))
+                root = parse_cim(handle.read())
             finally:
                 handle.close()
+            if not is_cim_root(root):
+                raise ValueError("the root object is not a CIM document")
+            documents.append(root)
         except Exception as exc:
             print("error: %s is %s: %s" % (path, UNSUPPORTED, exc),
                   file=sys.stderr)
@@ -2069,6 +2375,10 @@ def main(argv=None):
     if args.self_test:
         return self_test()
     if args.diff:
+        if args.root:
+            print("error: --diff takes exactly two documents and no folder",
+                  file=sys.stderr)
+            return 64
         return _run_diff(args)
 
     if not args.root:
@@ -2081,7 +2391,8 @@ def main(argv=None):
 
     unreadable = []
     paths = find_documents(args.root, unreadable)
-    if not paths and not unreadable:
+    # --json always prints JSON, so a consumer never meets a sentence.
+    if not paths and not unreadable and not args.json:
         print("no .aprx, .lyrx, .mapx or .pagx documents under %s" % args.root)
         return 0
 
