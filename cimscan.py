@@ -172,8 +172,8 @@ def _local(tag):
 def _from_xml(element):
     """Normalise a CIM XML element into the shape CIM JSON already has.
 
-    CIM ships two serialisations of one object model. An .aprx holds XML parts,
-    a .lyrx holds JSON, and the member names differ only in case:
+    CIM ships two serialisations of one object model. An .aprx holds XML parts
+    (older files) or JSON parts (Pro 3.6), a .lyrx holds JSON, and the member names differ only in case:
     <DataConnection> in XML is "dataConnection" in JSON. Lower-casing every key
     here collapses that difference, so one extractor reads both instead of two
     that drift apart.
@@ -217,7 +217,8 @@ def parse_cim(data):
     """Parse one CIM part, XML or JSON, into the normalised dict shape.
 
     Dispatch is on the first byte, not on the file extension. A part inside an
-    .aprx is XML, a .lyrx or .mapx on disk is JSON, and neither announces which.
+    .aprx is JSON (Pro 3.6) or XML (older), a .lyrx or .mapx on disk is JSON,
+    and none announces which.
     """
     raw = data.encode("utf-8") if isinstance(data, str) else data
     raw = raw.lstrip(b"\xef\xbb\xbf").lstrip()
@@ -346,6 +347,13 @@ def connection_facts(connection):
             dataset_type if isinstance(dataset_type, str) else kind)
 
 
+# Properties only a remote database connection string carries. DBCLIENT and
+# DB_CONNECTION_PROPERTIES name the database platform and where to reach it; a
+# file geodatabase string has neither.
+REMOTE_MARKERS = frozenset(
+    ("SERVER", "INSTANCE", "DBCLIENT", "DB_CONNECTION_PROPERTIES"))
+
+
 def workspace_path(workspace):
     """The filesystem path a workspace string points at, or None.
 
@@ -364,7 +372,7 @@ def workspace_path(workspace):
     if "=" not in workspace:
         return workspace
     props = parse_properties(workspace)
-    if "SERVER" in props or "INSTANCE" in props:
+    if REMOTE_MARKERS.intersection(props):
         return None
     return props.get("DATABASE") or None
 
@@ -793,8 +801,9 @@ def read_parts(path):
     """Return {part name: bytes} for one document. Raises on an unreadable one.
 
     A zipped document is recognised by its signature, not by its extension. An
-    .aprx is a zip of CIM XML parts; a .lyrx, .mapx or .pagx is bare CIM JSON on
-    disk and is not zipped at all. Assuming otherwise fails on half the tree.
+    .aprx is a zip of CIM parts (JSON parts from Pro 3.6, XML in older files); a
+    .lyrx, .mapx or .pagx is bare CIM JSON on disk and is not zipped at all.
+    Assuming otherwise fails on half the tree.
     """
     with open(path, "rb") as handle:
         signature = handle.read(2)
@@ -1016,7 +1025,10 @@ def _fixture_group_xml(name, children):
 
 
 def _build_fixture_aprx(target):
-    """A real zip, built with zipfile, shaped like an .aprx Pro actually writes."""
+    """A real zip of CIM XML parts, built with zipfile.
+
+    Pro 3.6 writes JSON parts; _build_fixture_aprx_json covers that layout.
+    """
     archive = zipfile.ZipFile(target, "w")
     try:
         # The case collision Pro really produces: map/ beside Map/.
@@ -1066,6 +1078,33 @@ def _build_fixture_aprx(target):
             % (FIXTURE_NS, FIXTURE_GDB))
     finally:
         archive.close()
+    return target
+
+
+def _build_fixture_aprx_json(target):
+    """An .aprx laid out the way ArcGIS Pro 3.6 writes one: a zip of JSON parts.
+
+    The part names follow a Blank.aprx saved by Pro 3.6: map/map.json,
+    Map/<id>.json, Index.json, GISProject.json and one DocumentInfo.xml. The
+    content is synthetic.
+    """
+    layer = {
+        "type": "CIMFeatureLayer", "name": "Roads", "uRI": "CIMPATH=Map/a1b2.json",
+        "featureTable": {"type": "CIMFeatureTable", "dataConnection": {
+            "type": "CIMStandardDataConnection",
+            "workspaceConnectionString": FIXTURE_SDE,
+            "workspaceFactory": "SDE", "dataset": "GIS.Roads",
+            "datasetType": "esriDTFeatureClass"}}}
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("map/map.json", json.dumps({
+            "type": "CIMMap", "name": "Transport", "uRI": "CIMPATH=map/map.json",
+            "layers": ["CIMPATH=Map/a1b2.json"]}))
+        archive.writestr("Map/a1b2.json", json.dumps(layer))
+        archive.writestr("Index.json", json.dumps({"type": "CIMIndex"}))
+        archive.writestr("GISProject.json", json.dumps({
+            "type": "CIMProject", "name": "Transport"}))
+        archive.writestr("DocumentInfo.xml", "<DocumentInfo><Title>Transport"
+                         "</Title></DocumentInfo>")
     return target
 
 
@@ -1322,7 +1361,7 @@ def self_test():
               "the server name is kept, it is the whole point of the scan")
         check("USER=viewer" in redact(FIXTURE_SDE), "the user name is kept")
         check(REDACTION in redact("ENCRYPTED_PASSWORD=abc123"),
-              "ENCRYPTED_PASSWORD is redacted too, the match is on a substring")
+              "an encrypted_password key is redacted too, the match is on a substring")
         check(redact("DATABASE=x.gdb") == "DATABASE=x.gdb",
               "a connection string with no secret passes through unchanged")
         check(redact("") == "", "an empty workspace redacts to empty")
@@ -1340,7 +1379,7 @@ def self_test():
         check(service.endswith("&f=json"),
               "the other query parameters survive, only the value goes")
         check(REDACTION in redact("DATABASE=x;CLIENT_SECRET=shhh"),
-              "CLIENT_SECRET is redacted, OAuth stores a credential there")
+              "a client_secret key is redacted, OAuth stores a credential there")
         check(redact("SERVER=a;INSTANCE=b") == "SERVER=a;INSTANCE=b",
               "a connection with no secret is returned byte for byte")
 
@@ -1349,7 +1388,7 @@ def self_test():
         check("00022e68" not in real,
               "neither stored password blob survives a real .sde connection")
         check(real.count(REDACTION) == 2,
-              "ENCRYPTED_PASSWORD and ENCRYPTED_PASSWORD_UTF8 both go")
+              "encrypted_password and encrypted_password_utf8 both go")
         check("INSTANCE=sde:sqlserver:dbhost1\\SQLEXPRESS" in real,
               "the instance, which is what a decommissioning plan needs, stays")
         check("USER=viewer_acct" in real and "VERSION=sde.DEFAULT" in real,
@@ -1379,6 +1418,10 @@ def self_test():
                              "USER=viewer") is None,
               "a direct connect names an INSTANCE and no SERVER, and its "
               "DATABASE is still not a folder")
+        for marker in ("DBCLIENT=sqlserver", "DB_CONNECTION_PROPERTIES=dbhost1"):
+            check(workspace_path("%s;DATABASE=warehouse1" % marker) is None,
+                  "%s with no SERVER or INSTANCE is still a remote database  "
+                  "<-- pinned defect" % marker.split("=")[0].lower())
         check(workspace_path("https://services.arcgis.com/x/FeatureServer/0")
               is None, "a service url is not a path")
         check(workspace_path("C:\\gis\\parcels.gdb") == "C:\\gis\\parcels.gdb",
@@ -1519,6 +1562,16 @@ def self_test():
               "an empty connection reads as unknown")
         check(connection_facts(None)[0] == "unknown",
               "a null connection reads as unknown")
+        check(connection_facts({"type": "T", "uri": "u1"})[1] == "u1",
+              "a connection with only a uri has that uri as its workspace")
+        only_url = connection_facts({"type": "T", "url": "h1",
+                                     "objectname": "o1", "objecttype": "x1"})
+        check(only_url[1:] == ("h1", "o1", "x1"),
+              "a service connection reads url, objectName and objectType")
+        check(connection_facts({"type": "T", "datasettype": "d1"})[3] == "d1",
+              "datasetType is the dataset type when it is present")
+        check(connection_facts({"type": "T"})[3] == "T",
+              "a connection with no dataset type falls back to its kind")
 
         # ---- the real zip: nesting, standalone tables, attribution
         document = scan_document(aprx)
@@ -1540,6 +1593,19 @@ def self_test():
         check(repr(by_layer["Owner Lookup"])
               == "Source(Planning/Owner Lookup -> Owners)",
               "a source prints the map, the layer and the dataset")
+
+        # ---- an .aprx in the layout Pro 3.6 writes: JSON parts, not XML
+        json_path = _build_fixture_aprx_json(
+            os.path.join(home, "Transport.aprx"))
+        json_aprx = scan_document(json_path)
+        os.remove(json_path)
+        check(json_aprx.status == OK and len(json_aprx.sources) == 1,
+              "an .aprx of JSON parts scans OK and finds its layer")
+        check(json_aprx.sources[0].dataset == "GIS.Roads"
+              and json_aprx.sources[0].container == "Transport",
+              "the JSON-part layer reports its dataset and its map")
+        check("hunter2" not in chr(10).join(report_lines([json_aprx])),
+              "a JSON-part .aprx never prints the password either")
 
         # ---- the relative database path that is not there
         buried = by_layer["Buried Parcels"]
@@ -2097,6 +2163,33 @@ def self_test():
         code, out = run(["--diff", lyrx, sde])
         check(code == 1 and "stalehost" in out,
               "and as the second document")
+        code, out = run([sdedir])
+        check(code == 0 and "no .aprx, .lyrx, .mapx or .pagx documents" in out
+              and "stalehost" not in out,
+              "a folder of .sde files exits 0 with the no-documents sentence "
+              "(a documented limit)")
+        check(not_cim_note(".sde") is None,
+              "a file named exactly .sde is not recognised (a documented limit)")
+
+        # ---- documented limits, pinned so the README cannot drift from them
+        check(_lower_keys({"uri": 1, "uRI": 2}) == {"uri": 2},
+              "two keys that differ only in case merge, the last one wins")
+        utf16 = os.path.join(workdir, "utf16.lyrx")
+        with open(utf16, "wb") as handle:
+            handle.write(u'{"type": "CIMLayerDocument"}'.encode("utf-16"))
+        check(scan_document(utf16).status == UNSUPPORTED,
+              "a UTF-16 .lyrx is UNSUPPORTED, not read")
+        listconn = os.path.join(workdir, "listconn.lyrx")
+        with open(listconn, "w") as handle:
+            handle.write(json.dumps({
+                "type": "CIMLayerDocument", "layers": ["CIMPATH=l.json"],
+                "layerDefinitions": [{
+                    "type": "CIMFeatureLayer", "name": "L",
+                    "uri": "CIMPATH=l.json",
+                    "featureTable": {"dataConnection": [{}]}}]}))
+        listed = scan_document(listconn)
+        check(listed.status == OK and listed.sources == [],
+              "a dataConnection that is an array is skipped (a documented limit)")
 
         # ---- credentials in the shapes the first pass missed
         amp = redact("USER=a;PASSWORD=Summer&Winter1;SERVER=h")
@@ -2134,7 +2227,7 @@ def self_test():
               "<-- pinned defect")
         check(all(REDACTION in redact(t) for t in
                   ("PWD=a", "DB_PASSWD=a", "X=1;pwd=a")),
-              "PWD and PASSWD spellings are redacted, in any case")
+              "pwd and passwd spellings are redacted, in any case")
         ftp = "ftp://u:pw@host/x"
         check(workspace_path(ftp) is None and "pw@" not in redact(ftp),
               "a URL of any scheme is no folder, so its userinfo is not "
@@ -2389,7 +2482,7 @@ def self_test():
                      ("URL=https://h/x?api-key=KX", "KX"),
                      ("URL=https://h/x?key=KX&f=json", "KX"))
         check(all(secret not in redact(text) for text, secret in spellings),
-              "PW, PASS, SIG, KEY, SESSION and Authorization values are "
+              "pw, pass, sig, key, session and authorization values are "
               "redacted  <-- pinned defect")
         check(redact("URL=https://h/x?sig=SX&f=json")
               == "URL=https://h/x?sig=%s&f=json" % REDACTION,

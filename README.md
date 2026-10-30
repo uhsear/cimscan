@@ -10,7 +10,7 @@ cannot run on the file server where the projects live.
 So nobody checks. On Monday the planning map book opens broken, with no record of what those layers
 used to point at.
 
-Esri's own answer is `arcpy.mp.ArcGISProject.listBrokenDataSources()`, which "returns a Python list
+Esri's own answer is `arcpy.mp.ArcGISProject.listBrokenDataSources()`, which "Returns a Python list
 of Layer and/or Table objects that have broken connections to their original source data for all
 maps in a project"
 ([Esri documentation](https://pro.arcgis.com/en/pro-app/latest/arcpy/mapping/arcgisproject-class.htm)).
@@ -27,6 +27,9 @@ cimscan self-test: no arcpy, no licence, no network
 PASS  a stored portal TOKEN never survives redaction  <-- pinned defect
 ...
 PASS  a token in a service URL query string is redacted too  <-- pinned defect
+...
+PASS  dbclient with no SERVER or INSTANCE is still a remote database  <-- pinned defect
+PASS  db_connection_properties with no SERVER or INSTANCE is still a remote database  <-- pinned defect
 ...
 PASS  a password holding an ampersand is redacted whole  <-- pinned defect
 PASS  a password holding a semicolon loses its tail too  <-- pinned defect
@@ -61,7 +64,7 @@ PASS  a zip of XML that names no CIM type is UNSUPPORTED, not OK  <-- pinned def
 PASS  a layer or map uri that is not a string still reports its layer  <-- pinned defect
 ...
 PASS  a secret inside the resolved path is redacted too  <-- pinned defect
-PASS  PW, PASS, SIG, KEY, SESSION and Authorization values are redacted  <-- pinned defect
+PASS  pw, pass, sig, key, session and authorization values are redacted  <-- pinned defect
 ...
 PASS  a URL password holding an at sign is redacted whole  <-- pinned defect
 ...
@@ -74,7 +77,7 @@ PASS  no shorter spelling of --apply or --check-network is accepted  <-- pinned 
 PASS  the full flag names still parse
 ...
 --------------------------------------------------------------------
-280 assertions, 0 failed
+289 assertions, 0 failed
 ```
 
 ## Requirements
@@ -116,8 +119,9 @@ python cimscan.py --diff before.lyrx after.lyrx
 | `--self-test` | off | Run the offline assertions and exit. |
 
 The UNC check is off by default because a stat against a server that is already switched off blocks
-for the full SMB timeout. Three hundred layers pointed at a decommissioned box turn a scan into an
-afternoon. Local paths are always checked; only the network round trip needs the flag. The share
+for the full SMB timeout. One stat on an unreachable documentation-range address (192.0.2.1) took
+21 seconds on the Windows host here, so three hundred layers on a decommissioned box cost about
+two hours. Local paths are always checked; only the network round trip needs the flag. The share
 host is read from the document, and Windows connects to it to answer the stat. Use
 `--check-network` and `--apply` only on documents you trust.
 
@@ -164,8 +168,9 @@ not exist, so every layer on it would otherwise read as gone. The same document 
 and `unknown` on every host that cannot.
 
 Sources are then grouped by workspace, because four layers on one `.sde` are one decommissioning
-decision and not four. The fixture project the self-test builds is a zip of CIM XML parts, the way
-an `.aprx` is. Scanned for real:
+decision and not four. The fixture project the self-test builds is a zip of CIM XML parts. A
+second fixture is a zip of JSON parts, which is the layout ArcGIS Pro 3.6 writes for an `.aprx`
+(see the format facts below). Scanning the XML fixture:
 
 ```
 $ python cimscan.py p20/Planning.aprx
@@ -319,7 +324,7 @@ workspaces: 0 source(s) across 0 workspace(s)
 ```
 
 The status, the count and the exit code are the ones the old message had: `UNSUPPORTED`, and exit 1.
-`--json` carries the same text in `notes`, and `--diff` prints it for either document:
+`--json` carries the same text in `notes`, and `--diff` prints it for whichever `.sde` comes first:
 
 ```
 $ python cimscan.py --diff Prod.sde Prod.sde
@@ -388,18 +393,24 @@ A search of GitHub for `lyrx` finds converters, not checkers:
 [geostyler-lyrx-parser](https://github.com/geostyler/geostyler-lyrx-parser) read a `.lyrx` to
 translate its styling for GeoServer, QGIS or GeoStyler. They do not report where a layer's data
 lives, and they do not read an `.aprx`. A search for a broken-data-source checker for `.aprx` files
-found nothing, which says only that the search found nothing.
+found nothing, which says only that the search found nothing. The one `.aprx` reader the search
+turned up, [aprx-tree-view](https://github.com/fpolia21/aprx-tree-view), converts a project into an
+HTML mind map. It reads a project; it does not check where its layers point.
 
 Two format facts cost more time than anything else here, and both are pinned by assertions:
 
-- An `.aprx` is a ZIP archive whose layer documents are CIM **XML**. A `.lyrx` is bare CIM **JSON**
-  on disk and is not zipped at all. Code that handles one fails silently on the other. Both
-  serialisations describe the same object model, and the member names differ only in case, so
+- An `.aprx` is a ZIP archive of CIM parts. ArcGIS Pro 3.6.0 writes them as **JSON** (`map/map.json`,
+  `Map/<id>.json`, `Index.json`, `GISProject.json`, plus one `DocumentInfo.xml`), as a Blank.aprx
+  saved by that version shows. Older projects and the main self-test fixture hold CIM **XML**
+  parts. A `.lyrx` is bare CIM **JSON** on disk and is not zipped at all. Code that handles one
+  fails silently on the other. The serialisations describe the same object model, and the member
+  names differ only in case, so
   `cimscan` lower-cases every member name and reads both with one extractor. The case is not
   predictable on either side: a saved `.lyrx` can spell the layer uri `"uRI"`, and the fixtures do.
   The CIM specification describes the JSON side
-  ([Esri cim-spec](https://github.com/Esri/cim-spec)); the XML parts inside an `.aprx` are not
-  covered by it, so that half is read from saved files.
+  ([Esri cim-spec](https://github.com/Esri/cim-spec)); the XML parts are not covered by it, so
+  that half is read from saved files. The self-test scans both layouts: an XML-part `.aprx` and a
+  JSON-part `.aprx` built to Pro 3.6's part names with synthetic content.
 - One zip can hold `Map/<name>.xml` and `map/<name>.xml`, the same folder spelled two ways, with one
   map part referencing layers under both spellings. The self-test fixture does that. A
   case-sensitive lookup drops those layers and still prints a clean-looking report, which is worse
@@ -446,9 +457,31 @@ Two format facts cost more time than anything else here, and both are pinned by 
   join. A relate to another table is not followed. A layer with no connection anywhere under it is
   skipped without a note. A layer nested more than 64 levels deep is dropped without a note.
 - A zip with two members of one name keeps only the last of them.
-- A workspace string with a `DATABASE` property and no `SERVER` or `INSTANCE`, for example a cloud
-  warehouse connection, is treated as a folder path and reported `MISSING`. The real shape of such a
-  string could not be checked offline.
+- A file named exactly `.sde`, with no name before the dot, is not recognised as a connection file
+  and gets the XML or JSON parse error.
+- A folder of `.sde` files exits 0 with the "no documents" sentence, so use stalehost for those.
+- Two keys in one JSON object that differ only in case are merged and the last one wins.
+- Only UTF-8 CIM JSON is read, and a UTF-16 or Latin-1 file is reported `UNSUPPORTED` with the
+  decoder's message.
+- A layer whose `dataConnection` is a JSON array instead of an object is skipped without a note, and
+  the document reports `OK` with no sources.
+- A drive-relative workspace such as `C:parcels.gdb` is checked against the current directory on
+  that drive of the scanning host, so the verdict depends on where the scan runs.
+- A secret key name with a tab or other whitespace before the `=`, an unencoded `/` or `;` in a URL
+  password, and a secret under a name that is not on the denylist, such as `AUTH` or `COOKIE`, print
+  as stored.
+- A UNC name in the `\\host@SSL\share` WebDAV form makes `--check-network` and `--apply` send an
+  HTTPS request. A reserved Windows device name such as `CON` in a relative workspace is statted
+  without any flag and can read as present or block. Scan only documents you trust.
+- An XML document with an undefined entity puts the entity name from the file into the
+  `UNSUPPORTED` note.
+- An `.aprx` with no layers reports `OK` with no sources, the same as one whose layer types the tool
+  does not recognise.
+- A workspace string is a remote database, not a folder, when it carries `SERVER`, `INSTANCE`,
+  `DBCLIENT` or `DB_CONNECTION_PROPERTIES`. A string with only a `DATABASE` property, as a cloud
+  warehouse connection might write, is still treated as a folder path and reported `MISSING`. The
+  property names Pro writes for each database platform are not listed in Esri's documentation, so
+  that list is read from saved files and could not be checked offline.
 - A drive letter mapped to a network share is treated as a local path and statted even without
   `--check-network`, because only `\\` and `//` are recognised as network paths.
 - A scan whose root is a UNC share reports every relative workspace as `unknown` unless
@@ -482,11 +515,11 @@ Two format facts cost more time than anything else here, and both are pinned by 
   the token.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20 and 3.13.2 on Windows
   and on 3.12.3 on Linux, each at the same assertion count, under `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1204 statements and 280
+- Branch coverage is 100 percent only with the two hosts combined: 1240 statements and 282
   branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1097-1098) and Linux
-  never runs the `icacls` ones (1089-1096). Both hosts print the same assertion count, 280. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1136-1137) and Linux
+  never runs the `icacls` ones (1128-1135). Both hosts print the same assertion count, 294. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
