@@ -10,6 +10,15 @@ cannot run on the file server where the projects live.
 So nobody checks. On Monday the planning map book opens broken, with no record of what those layers
 used to point at.
 
+Esri's own answer is `arcpy.mp.ArcGISProject.listBrokenDataSources()`, which "returns a Python list
+of Layer and/or Table objects that have broken connections to their original source data for all
+maps in a project"
+([Esri documentation](https://pro.arcgis.com/en/pro-app/latest/arcpy/mapping/arcgisproject-class.htm)).
+It understands every layer type Pro understands and follows the format as it changes. It needs
+arcpy and a licence on the machine that runs it. `cimscan` reads the project files directly, so it
+runs where the projects live, and it lists every source and not only the broken ones. See
+[Why not arcpy](#why-not-arcpy).
+
 ```
 $ python cimscan.py --self-test
 cimscan self-test: no arcpy, no licence, no network
@@ -39,18 +48,38 @@ PASS  --diff of two JSON files that are not CIM exits 1  <-- pinned defect
 PASS  a drive path on a POSIX host is unknown, not MISSING  <-- pinned defect
 PASS  a UNC path on a POSIX host is unknown even with --check-network  <-- pinned defect
 ...
+PASS  a drive letter the session does not have is unknown, not MISSING  <-- pinned defect
+...
 PASS  --json on a folder with no documents is still JSON  <-- pinned defect
+...
+PASS  the footer counts every source and only the MISSING ones  <-- pinned defect
+...
+PASS  a layer the layers array does not list is still reported  <-- pinned defect
+...
+PASS  a zip of XML that names no CIM type is UNSUPPORTED, not OK  <-- pinned defect
+...
+PASS  a layer or map uri that is not a string still reports its layer  <-- pinned defect
+...
+PASS  a secret inside the resolved path is redacted too  <-- pinned defect
+PASS  PW, PASS, SIG, KEY, SESSION and Authorization values are redacted  <-- pinned defect
+...
+PASS  a URL password holding an at sign is redacted whole  <-- pinned defect
+...
+PASS  every parser error exits 64  <-- pinned defect
+...
+PASS  the process itself exits 64 on --ap, not argparse's 2  <-- pinned defect
 ...
 PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 PASS  no shorter spelling of --apply or --check-network is accepted  <-- pinned defect
+PASS  the full flag names still parse
 ...
 --------------------------------------------------------------------
-255 assertions, 0 failed
+280 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. Standard library only: `zipfile`, `xml.etree.ElementTree`, `json`, `os`, `re`,
+Python 3.9 or newer, run on 3.9, 3.10, 3.12 and 3.13. Standard library only: `zipfile`, `xml.etree.ElementTree`, `json`, `os`, `re`,
 `argparse`. No `arcpy`, no ArcGIS licence, no install step. It runs on ArcGIS Pro's Python and on a
 plain `python3` on a file server.
 
@@ -83,7 +112,7 @@ python cimscan.py --diff before.lyrx after.lyrx
 | `--json` | off | Emit the scan as JSON instead of the text report. |
 | `--diff BEFORE AFTER` | none | Compare two layer documents semantically instead of scanning a tree. Takes no folder. |
 | `--check-network` | off | Stat paths on UNC network shares. |
-| `--apply` | off | The same authorisation as `--check-network`. Nothing is ever written. |
+| `--apply` | off | The same authorisation as `--check-network`. Nothing is ever written. The name follows the write gate of the other tools in this portfolio, and here it gates one network stat because the tool has no write to gate. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
 The UNC check is off by default because a stat against a server that is already switched off blocks
@@ -93,7 +122,27 @@ host is read from the document, and Windows connects to it to answer the stat. U
 `--check-network` and `--apply` only on documents you trust.
 
 The parser refuses abbreviated flags (`allow_abbrev=False`). `--ap` is an error and not `--apply`,
-so the one flag that authorises an outbound action cannot be typed by accident.
+so the one flag that authorises an outbound action cannot be typed by accident. The parser exits 64
+on that error and on every other bad command line.
+
+The UNC check was run for real once, by hand, on Windows against the administrative share of the
+machine itself, and not in the self-test, because a share is specific to a host. The tool has no
+HTTP path, so there is no `http.server` stub to point it at:
+
+```
+$ python cimscan.py Loop.lyrx --check-network
+== Loop.lyrx  [OK]
+   present  (no map) > Here                    x                        \\localhost\C$\Windows
+   MISSING  (no map) > Gone                    x                        \\localhost\C$\no-such-folder-cimscan
+
+workspaces: 2 source(s) across 2 workspace(s)
+      1  present  \\localhost\C$\Windows
+      1  MISSING  \\localhost\C$\no-such-folder-cimscan
+
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 1 missing, 0 unreadable directory(s)
+```
+
+Without the flag the same two rows read `unknown`.
 
 ## What it reports
 
@@ -109,7 +158,9 @@ For every layer and standalone table in every document:
 path to check, and calling them `MISSING` would bury the file geodatabases that really are gone.
 A Windows path (a drive letter or a UNC share) read on a Linux host is `unknown` too. The host
 cannot evaluate it, so a layer on `C:\gis\parcels.gdb` is not `MISSING` just because the file
-server has no `C:` drive. The same document gives the same verdict on every host that can answer,
+server has no `C:` drive. A drive letter the running Windows session does not have is `unknown`
+for the same reason. A scheduled task does not see the drives a user mapped, and its `X:` root does
+not exist, so every layer on it would otherwise read as gone. The same document gives the same verdict on every host that can answer,
 and `unknown` on every host that cannot.
 
 Sources are then grouped by workspace, because four layers on one `.sde` are one decommissioning
@@ -120,13 +171,13 @@ an `.aprx` is. Scanned for real:
 $ python cimscan.py p20/Planning.aprx
 == p20/Planning.aprx  [OK]
    MISSING  Planning > Buried Parcels          Parcels                  DATABASE=..\commondata\parcels.gdb
-   unknown  Planning > Zoning A                GIS.Zoning_a             SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=gisdata;USER=viewer;PASSWORD=***REDACTED***;AUTHENTICATION_MODE=DBMS
+   unknown  Planning > Zoning A                GIS.Zoning_a             SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***;AUTHENTICATION_MODE=DBMS
    ...
    MISSING  Planning > Owner Lookup            Owners                   DATABASE=..\commondata\parcels.gdb
 
 workspaces: 7 source(s) across 2 workspace(s)
-      2  MISSING  DATABASE=..\commondata\parcels.gdb  -> ...\p20\commondata\parcels.gdb
-      5  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=gisdata;USER=viewer;PASSWORD=***REDACTED***;AUTHENTICATION_MODE=DBMS
+      2  MISSING  DATABASE=..\commondata\parcels.gdb  -> ...\commondata\parcels.gdb
+      5  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***;AUTHENTICATION_MODE=DBMS
 
 1 document(s), 1 OK, 0 UNSUPPORTED, 7 source(s), 2 missing, 0 unreadable directory(s)
 ```
@@ -156,10 +207,10 @@ nothing and the scan still exited 0. Each nested table is now its own row under 
 ```
 $ python cimscan.py Joined.lyrx --filter olddb
 == Joined.lyrx  [OK]
-   unknown  (no map) > Parcels joined          GIS.Owners               SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=gisdata
+   unknown  (no map) > Parcels joined          GIS.Owners               SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
 
 workspaces: 1 source(s) across 1 workspace(s)
-      1  unknown  SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=gisdata
+      1  unknown  SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
 ```
 
 A plan row names the resolved path as well as the workspace string. Two projects both saying
@@ -169,7 +220,7 @@ row on the text alone let a geodatabase that was gone hide behind a row reading 
 ## What it refuses
 
 It refuses to report an unreadable document as a clean one. A document whose container will not
-open, whose parts will not parse, that holds no CIM parts at all, or whose root object names no CIM
+open, whose parts will not parse, that holds no CIM parts at all, or whose root object, or every zipped part, names no CIM
 type, is marked `UNSUPPORTED`, counted separately, and drives the exit code to 1.
 
 ```
@@ -215,7 +266,8 @@ nothing is claimed about them: the count says only how much of the tree the repo
 
 It also refuses to print a secret. An `.sde` connection string saved with a stored credential holds
 `PASSWORD=` or `ENCRYPTED_PASSWORD=` in clear text inside the document. Any property whose name
-contains `PASSWORD`, `PASSWD`, `PWD`, `TOKEN`, `SECRET`, `APIKEY`, `API_KEY` or `CREDENTIAL`
+contains `PASS`, `PW`, `TOKEN`, `SECRET`, `KEY`, `CREDENTIAL`, `SIG`, `SESSION`,
+`AUTHORIZATION` or `BEARER`
 loses its whole value before the record is built, so the text report, the `--json` output and the
 `--diff` output are all covered by one guard instead of three. The rules are:
 
@@ -226,10 +278,14 @@ loses its whole value before the record is built, so the text report, the `--jso
 - In every other property, a `name=value` pair with a secret name is redacted wherever it sits: in
   the query string of a `URL=` property, or inside `CUSTOMPARAMETERS=token=...`. The other query
   parameters and the key are kept.
-- A password in URL userinfo (`scheme://user:password@host`) is redacted and the user kept.
+- A password in URL userinfo (`scheme://user:password@host`) is redacted and the user kept. The
+  password runs to the last `@` before the path, so one that holds `@` goes whole.
+- The match is on a substring and errs toward hiding. A harmless `KEYFILE` loses its value too.
+- The resolved `path` field gets the same treatment, so a secret in a `DATABASE=` URL does not
+  reach it.
 - A URL of any scheme is never treated as a folder, so its userinfo cannot reach the `path` field.
 
-Redacting the workspace also means a scan of a shared drive can be committed or pasted into a
+Redacting the workspace and the path also means a scan of a shared drive can be committed or pasted into a
 ticket. This is a real scan of two layers that hold a token and a password with an ampersand:
 
 ```
@@ -241,9 +297,10 @@ $ python cimscan.py Secrets.lyrx
 
 ## An .sde on the command line
 
-An `.sde` is not a CIM document. Esri's Create Database Connection tool describes its output as "a
-file that ArcGIS uses to connect to a database, a cloud data warehouse, or an enterprise
-geodatabase", and says "the output file will have the .sde extension"
+An `.sde` is not a CIM document. The Create Database Connection tool summary reads "Creates a file
+that ArcGIS uses to connect to a database, a cloud data warehouse, or an enterprise geodatabase".
+Its `out_name` parameter says "The output file will have the .sde extension", and its output is a
+"database connection file (.sde or .dbconn)"
 ([Esri documentation](https://pro.arcgis.com/en/pro-app/3.5/tool-reference/data-management/create-database-connection.htm)).
 Before this note existed, an `.sde` handed to `cimscan` went to the XML parser and came back as
 `part Prod.sde did not parse: not well-formed (invalid token)`. That was true, and it told the
@@ -307,8 +364,11 @@ where a credential would otherwise reach a pull request. These files are self-te
 ## Exit codes
 
 0 every document parsed and every directory listed, 1 at least one `UNSUPPORTED` or at least one
-directory that could not be listed, 2 the scan path does not exist, 64 usage error. A root folder
-that exists and cannot be listed exits 1, not 2.
+directory that could not be listed, 2 the scan path does not exist, 64 usage error. Usage error
+covers no root, `--diff` with a folder, and every argument the parser rejects: an unknown flag, a
+prefix such as `--ap`, `--diff` without two documents. The parser's own default for these is 2, so
+it is overridden and 2 always means a missing path. A root folder that exists and cannot be listed
+exits 1, not 2.
 
 ## Why not arcpy
 
@@ -391,21 +451,49 @@ Two format facts cost more time than anything else here, and both are pinned by 
   string could not be checked offline.
 - A drive letter mapped to a network share is treated as a local path and statted even without
   `--check-network`, because only `\\` and `//` are recognised as network paths.
-- Redaction is a denylist of key names, the eight fragments listed above. Other spellings print as
-  stored: `PW`, `ACCOUNT_KEY`, `ACCESS_KEY_ID`, a SAS `sig=` parameter, `SESSIONID`. I found no list
-  of the keys Esri writes into a workspace connection string, so the list cannot be checked against
-  one. An unquoted password that holds both a `;` and an `=` leaks the part after the `=`, because
-  that part reads as a property of its own. Pro stores `ENCRYPTED_PASSWORD` as hex, so this
-  affects only hand-written strings.
-- Python 3.9 is the stated floor and was not run: the tool was run on 3.12 and 3.13. It uses no
-  f-strings and no syntax newer than 3.9, and that is a reading of the code and not a test.
-- Coverage of the module is 100 percent branch with the two hosts together, and 99 percent on each
-  alone. `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch
-  for Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines and Linux never
-  runs the `icacls` ones. Both hosts print the same assertion count, 255. Measuring coverage
-  needs the `coverage` module, which a stock server `python3` lacks.
+- A scan whose root is a UNC share reports every relative workspace as `unknown` unless
+  `--check-network` is passed, because the resolved path is itself a UNC path.
+- On a case-sensitive Linux filesystem, a workspace path whose case differs from the folder on disk
+  is reported `MISSING` although Windows would find it. A Windows-rooted path with no drive, such as
+  `\data\x.gdb`, is statted as `/data/x.gdb` on Linux, so that verdict differs by host.
+- For a folder-based workspace such as a shapefile or CSV folder, only the folder is checked. A
+  deleted dataset file inside an existing folder is reported `present`.
+- A service layer keeps its URL in a nested `serverConnection`, so its row shows `(no dataset)`:
+  `objectName` is not read from the outer connection.
+- A filtered scan hides an `[OK]` document that matched nothing. A `--filter` match also reads the
+  resolved path, so a document stored in a folder whose name holds the filter text matches on every
+  relative workspace.
+- A directory walk ignores `.sde` files and exits 0 on a folder that holds only `.sde` files. The
+  `.sde` note appears only when the file is named on the command line. `Prod.sde` with a trailing
+  space or dot is not recognised, and a directory whose own name ends in `.sde` is walked as a
+  folder and gets no note. With `--diff`, the note is printed for the first `.sde` argument only.
+- Only `.aprx`, `.lyrx`, `.mapx` and `.pagx` are walked. A tree of ArcMap `.mxd` or `.lyr` files, or
+  `.aptx` templates, prints `no ... documents under <dir>` and exits 0.
+- Piping the output to a program that closes early, such as `head`, raises `BrokenPipeError` with a
+  traceback and exits 1. An unexpected internal error exits 1 with a traceback, the same code as an
+  `UNSUPPORTED` document.
+- Redaction is a denylist of key-name fragments, the ten listed above. A secret stored under a name
+  with none of them prints as stored. I found no list of the keys Esri writes into a workspace
+  connection string, so the list cannot be checked against one. An `Authorization: Bearer ...`
+  header written with a colon has no `=` and is not redacted. An unquoted password that holds both a
+  `;` and an `=` leaks the part after the `=`, because that part reads as a property of its own.
+- Only the workspace string and the resolved path are redacted. The dataset, layer, map and
+  connection-type fields print as stored, so a dataset that is itself a URL with a token would show
+  the token.
+- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20 and 3.13.2 on Windows
+  and on 3.12.3 on Linux, each at the same assertion count, under `-W error`.
+- Branch coverage is 100 percent only with the two hosts combined: 1204 statements and 280
+  branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
+  `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1097-1098) and Linux
+  never runs the `icacls` ones (1089-1096). Both hosts print the same assertion count, 280. The
+  Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
+  because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
-  on its own temporary folder. It touches no other data.
+  on its own temporary folder. It touches no other data. A scan writes nothing: an audit hook
+  over `--json`, `--apply`, `--check-network` and `--diff` runs recorded no write open, no
+  subprocess and no socket. Killing the self-test mid-run, for example with `taskkill`, can leave a
+  locked `cimscan-test-*` folder in the temp directory.
 - A layer name holding characters the console codepage cannot encode prints as `?`. The scan
   finishes; `--json` written to a file keeps the real name.
 

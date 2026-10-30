@@ -64,12 +64,15 @@ REDACTION = "***REDACTED***"
 
 # A connection-string key holding one of these substrings carries a secret. An
 # .sde property set uses PASSWORD and ENCRYPTED_PASSWORD, so the match is on a
-# substring rather than on a list of names Esri is free to add to. TOKEN,
-# SECRET and the API key spellings are here because a portal or feature service
-# connection stores its credential under one of those names, and a token in a
-# ticket is as usable as a password until it expires.
-SECRET_KEY_MARKERS = ("PASSWORD", "PASSWD", "PWD", "TOKEN", "SECRET", "APIKEY",
-                      "API_KEY", "CREDENTIAL")
+# substring rather than on a list of names Esri is free to add to. PASS covers
+# PASSWORD, PASSWD and PASSPHRASE, and KEY covers every API, account and access
+# key spelling. SIG is a signed-URL signature (sig=, SIGNATURE). TOKEN, SECRET,
+# SESSION, AUTHORIZATION and BEARER are here because a portal or feature
+# service connection stores its credential under one of those names, and a
+# token in a ticket is as usable as a password until it expires. The match errs
+# toward hiding: a harmless key such as KEYFILE loses its value too.
+SECRET_KEY_MARKERS = ("PASS", "PW", "TOKEN", "SECRET", "KEY", "CREDENTIAL",
+                      "SIG", "SESSION", "AUTHORIZATION", "BEARER")
 
 # The part name given to a document that holds its layer at the root instead of
 # in a definitions array. Any name that no CIMPATH can spell would do; this one
@@ -243,7 +246,8 @@ _SECRET_PAIR = re.compile(
     % "|".join(re.escape(m) for m in SECRET_KEY_MARKERS), re.IGNORECASE)
 
 # scheme://user:password@host, the one credential spelling with no "=" in it.
-_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/:@\s;?#]*):[^/@\s;?#]*@")
+# The password runs to the LAST "@" before the path, so one holding "@" goes whole.
+_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/:@\s;?#]*):[^/\s;?#]*@")
 
 # A property name, as opposed to the front of a URL that holds a "?token=" key.
 _PLAIN_KEY = re.compile(r"^[\w .-]*$")
@@ -421,6 +425,10 @@ def check_presence(path, check_network, exists=os.path.exists,
     evaluated there: os.path.exists is always False for it, so every such layer
     came out MISSING on the file server. The honest verdict is unknown.
 
+    A drive letter that is not mapped in the running session is unknown for the
+    same reason: its root does not exist, so every path under it would read as
+    gone when the host simply cannot see it.
+
     A UNC stat against a server that is already switched off blocks for the full
     SMB timeout. Three hundred layers pointed at a decommissioned box turn a
     scan into an afternoon, so the network check is opt in.
@@ -430,6 +438,10 @@ def check_presence(path, check_network, exists=os.path.exists,
     if not windows and (is_windows_absolute(path) or path[1:2] == ":"):
         return None
     if is_network_path(path) and not check_network:
+        return None
+    if windows and path[1:2] == ":" and not exists(path[:2] + chr(92)):
+        # A drive letter this session does not have, such as a user's mapped
+        # share seen from a scheduled task, cannot be evaluated either.
         return None
     return bool(exists(path))
 
@@ -537,6 +549,15 @@ def as_list(value):
     return [value]
 
 
+def _part_name(definition, fallback):
+    """The uri a layer part is filed under, or the fallback when it is no string.
+
+    A uri that is a list or a number cannot key a dict, and Pro never writes one.
+    """
+    uri = definition.get("uri")
+    return uri if isinstance(uri, str) and uri else fallback
+
+
 def document_parts(root):
     """Split one parsed JSON document into (parts, roots).
 
@@ -559,12 +580,11 @@ def document_parts(root):
                 "standalonetabledefinitions"):
         for index, definition in enumerate(as_list(root.get(key))):
             if isinstance(definition, dict):
-                name = definition.get("uri") or "%s#%d" % (key, index)
-                parts[name] = definition
+                parts[_part_name(definition, "%s#%d" % (key, index))] = definition
     for key in ("mapdefinition", "layoutdefinition"):
         definition = root.get(key)
         if isinstance(definition, dict):
-            parts[definition.get("uri") or key] = definition
+            parts[_part_name(definition, key)] = definition
     if not parts:
         # The sentinel is named, not empty. part_key refuses an empty reference,
         # because a layer with no uri must not match a part, so an empty
@@ -657,7 +677,7 @@ def collect_sources(document, parts, roots, home, check_network,
                 dataset=dataset,
                 dataset_type=dataset_type,
                 workspace=redact(workspace),
-                path=path,
+                path=redact(path) if path else path,
                 present=check_presence(path, check_network, exists),
             ))
     return sources
@@ -819,6 +839,8 @@ def scan_document(path, check_network=False, exists=os.path.exists):
             notes.append("the root object is not a CIM document")
         parts, roots = document_parts(root)
     else:
+        if parsed and not any(is_cim_root(p) for p in parsed.values()):
+            notes.append("no part is a CIM document")
         parts, roots = parsed, sorted(parsed)
 
     sources = collect_sources(path, parts, roots, home, check_network, exists)
@@ -952,7 +974,7 @@ def diff_lines(changes):
 FIXTURE_NS = ('xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
               'xmlns:typens="http://www.esri.com/schemas/ArcGIS/2.9.0"')
 
-FIXTURE_SDE = ("SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=gisdata;"
+FIXTURE_SDE = ("SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=warehouse1;"
                "USER=viewer;PASSWORD=hunter2;AUTHENTICATION_MODE=DBMS")
 
 FIXTURE_GDB = "DATABASE=..\\commondata\\parcels.gdb"
@@ -966,7 +988,7 @@ FIXTURE_SDE_REAL = (
     "ENCRYPTED_PASSWORD_UTF8=00022e68e1f40c7b25d3;"
     "SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1\\SQLEXPRESS;"
     "DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=dbhost1\\SQLEXPRESS;"
-    "DATABASE=gisdata;USER=viewer_acct;AUTHENTICATION_MODE=DBMS;"
+    "DATABASE=warehouse1;USER=viewer_acct;AUTHENTICATION_MODE=DBMS;"
     "BRANCH=sde.DEFAULT;VERSION=sde.DEFAULT")
 
 
@@ -1265,6 +1287,7 @@ def self_test():
     """Assertions over the parser and the decision core. No arcpy, no network."""
     import io
     import shutil
+    import subprocess
     import tempfile
 
     tally = _Tally()
@@ -1344,7 +1367,7 @@ def self_test():
         # ---- connection string properties
         props = parse_properties(FIXTURE_SDE)
         check(props["SERVER"] == "dbhost1", "the server property is read")
-        check(props["DATABASE"] == "gisdata", "the database property is read")
+        check(props["DATABASE"] == "warehouse1", "the database property is read")
         check(parse_properties("") == {}, "an empty string yields no properties")
 
         # ---- which workspaces are paths at all
@@ -1352,7 +1375,7 @@ def self_test():
               "a file geodatabase workspace is a path")
         check(workspace_path(FIXTURE_SDE) is None,
               "a remote DATABASE is a database name, not a path")
-        check(workspace_path("INSTANCE=sde:oracle11g:gisdb;DATABASE=gisdata;"
+        check(workspace_path("INSTANCE=sde:oracle11g:gisdb;DATABASE=warehouse1;"
                              "USER=viewer") is None,
               "a direct connect names an INSTANCE and no SERVER, and its "
               "DATABASE is still not a folder")
@@ -2122,7 +2145,7 @@ def self_test():
 
         # ---- a joined layer reports the tables it joins
         join_workspace = ("SERVER=olddb;INSTANCE=sde:sqlserver:olddb;"
-                          "DATABASE=gisdata")
+                          "DATABASE=warehouse1")
         joindir = os.path.join(workdir, "joins")
         os.makedirs(joindir)
         join_path = os.path.join(joindir, "Joined.lyrx")
@@ -2206,6 +2229,7 @@ def self_test():
 
         # ---- a Windows path read on a POSIX host is unknown, not MISSING
         gone = lambda _p: False
+        mapped = lambda p: p == "C:\\"
         check(check_presence("C:\\data\\x.gdb", False, gone, windows=False)
               is None and check_presence("C:x.gdb", False, gone, windows=False)
               is None,
@@ -2215,10 +2239,18 @@ def self_test():
               is None,
               "a UNC path on a POSIX host is unknown even with --check-network"
               "  <-- pinned defect")
-        check(check_presence("C:\\data\\x.gdb", False, gone, windows=True)
+        check(check_presence("C:\\data\\x.gdb", False, mapped, windows=True)
               is False and check_presence("/srv/x.gdb", False, gone,
                                           windows=False) is False,
               "a Windows host still stats its drive, and a POSIX host its own")
+        check(check_presence("X:\\projects\\p.gdb", False, mapped,
+                             windows=True) is None,
+              "a drive letter the session does not have is unknown, not "
+              "MISSING  <-- pinned defect")
+        check(check_presence("C:\\data\\x.gdb", False,
+                             lambda p: p in ("C:\\", "C:\\data\\x.gdb"),
+                             windows=True) is True,
+              "a path on a drive the session does have is still present")
         drive_path = os.path.join(joindir, "Drive.lyrx")
         handle = open(drive_path, "w")
         handle.write(_fixture_layers_lyrx(
@@ -2242,6 +2274,161 @@ def self_test():
         code, out = run([emptydir])
         check(code == 0 and "no .aprx" in out,
               "without --json the sentence is unchanged")
+
+        # ---- the report's own arithmetic: footer, tally, widths, labels
+        def make_source(layer, present, path, workspace="DATABASE=a.gdb"):
+            return Source("d.lyrx", "m", layer, "CIMStandardDataConnection",
+                          "DS", "t", workspace, path, present)
+        counted = Document("d.lyrx", OK, [make_source("A", False, "/r/a"),
+                                          make_source("B", True, "/r/b"),
+                                          make_source("C", None, None)], [])
+        lines = report_lines([counted])
+        check(lines[-1] == "1 document(s), 1 OK, 0 UNSUPPORTED, 3 source(s), "
+              "1 missing, 0 unreadable directory(s)",
+              "the footer counts every source and only the MISSING ones"
+              "  <-- pinned defect")
+        check("workspaces: 3 source(s) across 3 workspace(s)" in lines,
+              "the workspace summary counts the same sources")
+        check(lines[1] == "   MISSING  " + "m > A".ljust(34) + " "
+              + "DS".ljust(24) + " DATABASE=a.gdb",
+              "a source row keeps its 34 and 24 column widths")
+        check("      1  MISSING  DATABASE=a.gdb  -> /r/a" in lines,
+              "a plan row names the resolved path after an arrow")
+        check("      1  unknown  DATABASE=a.gdb" in lines,
+              "a plan row with no path carries no arrow")
+        bare = Document("e.lyrx", OK, [], [])
+        lines = report_lines([bare])
+        check("   (no data sources read)" in lines and lines[-1]
+              == "1 document(s), 1 OK, 0 UNSUPPORTED, 0 source(s), "
+              "0 missing, 0 unreadable directory(s)",
+              "a document with no sources says so and adds nothing to the footer"
+              "  <-- pinned defect")
+
+        # ---- a layer the document lists but its layers array does not
+        leftover = json.loads(_fixture_layers_lyrx([
+            ("Kept", _fixture_std("DATABASE=..\\a.gdb", "A")),
+            ("Unlisted", _fixture_std(
+                "SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1",
+                "B"))]))
+        leftover["layers"] = leftover["layers"][:1]
+        leftover_path = os.path.join(workdir, "Leftover.lyrx")
+        with open(leftover_path, "w") as handle:
+            json.dump(leftover, handle)
+        leftover_doc = scan_document(leftover_path)
+        check(sorted(s.layer for s in leftover_doc.sources)
+              == ["Kept", "Unlisted"],
+              "a layer the layers array does not list is still reported"
+              "  <-- pinned defect")
+        code, out = run([leftover_path, "--filter", "olddb"])
+        check(code == 0 and "Unlisted" in out and "1 source(s)" in out,
+              "--filter finds the host behind an unlisted layer"
+              "  <-- pinned defect")
+
+        # ---- a zip whose parts are XML but not CIM
+        notcim_path = os.path.join(workdir, "NotCim.aprx")
+        archive = zipfile.ZipFile(notcim_path, "w")
+        archive.writestr("GISProject.xml",
+                         "<Project><Name>annual report</Name></Project>")
+        archive.close()
+        notcim = scan_document(notcim_path)
+        check(notcim.status == UNSUPPORTED
+              and "no part is a CIM document" in notcim.notes,
+              "a zip of XML that names no CIM type is UNSUPPORTED, not OK"
+              "  <-- pinned defect")
+        code, out = run([notcim_path])
+        check(code == 1, "and the exit code says so  <-- pinned defect")
+
+        # ---- a uri that is not a string must not end the scan
+        oddly = json.loads(_fixture_layers_lyrx([
+            ("Odd", _fixture_std("DATABASE=..\\a.gdb", "A"))]))
+        oddly["layerDefinitions"][0]["uri"] = ["a"]
+        oddly["mapDefinition"] = {"type": "CIMMap", "name": "M", "uri": 5}
+        oddly_path = os.path.join(workdir, "Odd.lyrx")
+        with open(oddly_path, "w") as handle:
+            json.dump(oddly, handle)
+        oddly_doc = scan_document(oddly_path)
+        check([s.layer for s in oddly_doc.sources] == ["Odd"],
+              "a layer or map uri that is not a string still reports its layer"
+              "  <-- pinned defect")
+
+        # ---- fields read from a hostile or odd connection
+        check(connection_facts({"type": "CIMStandardDataConnection",
+                                "workspaceconnectionstring": 5,
+                                "dataset": ["x"], "datasettype": 7})
+              == ("CIMStandardDataConnection", "", "",
+                  "CIMStandardDataConnection"),
+              "a workspace, dataset or dataset type that is no string is "
+              "dropped, not printed")
+        check(oddly_doc.sources[0].to_dict()["datasetType"] == "esriDTTable",
+              "--json carries the dataset type")
+        unc_path = os.path.join(workdir, "Unc.lyrx")
+        with open(unc_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("U", _fixture_std("\\\\nosuchhost\\share\\x.gdb", "x"))]))
+        check(scan_document(unc_path).sources[0].state == UNKNOWN,
+              "scan_document stats no network share unless told to")
+        secret_path = os.path.join(workdir, "SecretPath.lyrx")
+        with open(secret_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("S", _fixture_std("DATABASE=https://h/x?token=TOKX", "x"))]))
+        secret_doc = scan_document(secret_path)
+        shown = json.dumps(json_report([secret_doc])) + "".join(
+            report_lines([secret_doc]))
+        check("TOKX" not in shown and REDACTION in secret_doc.sources[0].path,
+              "a secret inside the resolved path is redacted too"
+              "  <-- pinned defect")
+
+        # ---- credential spellings the first denylist missed
+        spellings = (("ACCOUNT_KEY=KX", "KX"), ("AccountKey=KX", "KX"),
+                     ("ACCOUNTKEY=KX", "KX"), ("ACCESS_KEY_ID=KX", "KX"),
+                     ("SERVER=a;PW=PX;USER=u", "PX"), ("PASS=PX;USER=u", "PX"),
+                     ("PASSPHRASE=PX", "PX"), ("SIGNATURE=SX", "SX"),
+                     ("SESSIONID=SX", "SX"), ("Authorization=Bearer BX", "BX"),
+                     ("BEARER=BX", "BX"),
+                     ("URL=https://h/x?sig=SX&f=json", "SX"),
+                     ("URL=https://h/x?api-key=KX", "KX"),
+                     ("URL=https://h/x?key=KX&f=json", "KX"))
+        check(all(secret not in redact(text) for text, secret in spellings),
+              "PW, PASS, SIG, KEY, SESSION and Authorization values are "
+              "redacted  <-- pinned defect")
+        check(redact("URL=https://h/x?sig=SX&f=json")
+              == "URL=https://h/x?sig=%s&f=json" % REDACTION,
+              "a redacted query value keeps the other parameters")
+        check(redact("SERVER=a;USER=u;AUTHENTICATION_MODE=DBMS")
+              == "SERVER=a;USER=u;AUTHENTICATION_MODE=DBMS",
+              "a connection string with no secret comes out unchanged")
+        check(redact("URL=https://u:p@ss@h/x")
+              == "URL=https://u:%s@h/x" % REDACTION,
+              "a URL password holding an at sign is redacted whole"
+              "  <-- pinned defect")
+        check(redact("PASSWORD=a;b;USER=u;c")
+              == "PASSWORD=%s;USER=u;c" % REDACTION,
+              "a chunk after an ordinary property is kept, not swallowed")
+
+        # ---- usage errors exit 64, and a missing path still exits 2
+        def parse_exit(argv):
+            saved = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                _parse(argv)
+            except SystemExit as exc:
+                return exc.code
+            finally:
+                sys.stderr = saved
+            return None
+        check(all(parse_exit(argv) == 64 for argv in (
+            [workdir, "--ap"], ["--bogus"], ["--diff", "a.lyrx"],
+            [workdir, "--filter"])),
+            "every parser error exits 64  <-- pinned defect")
+        check(parse_exit([workdir]) is None,
+              "a valid command line does not exit at the parser")
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--ap", workdir],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child.communicate()
+        check(child.returncode == 64,
+              "the process itself exits 64 on --ap, not argparse's 2"
+              "  <-- pinned defect")
 
         # ---- argument handling
         args = _parse([workdir])
@@ -2286,8 +2473,20 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors exit 64, not argparse's 2.
+
+    Exit 2 is "the scan path does not exist". A job with a mistyped flag must
+    not read like a missing share.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="cimscan.py",
         allow_abbrev=False,
         description="Report every data source in a tree of .aprx, .lyrx, .mapx "
