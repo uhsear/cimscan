@@ -89,12 +89,12 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-329 assertions, 0 failed
+330 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer, run on 3.9, 3.10, 3.12 and 3.13. Standard library only: `zipfile`, `xml.etree.ElementTree`, `json`, `os`, `re`,
+Python 3.9 or newer, run on 3.9, 3.10, 3.11, 3.12 and 3.13. Standard library only: `zipfile`, `xml.etree.ElementTree`, `json`, `os`, `re`,
 `argparse`. No `arcpy`, no ArcGIS licence, no install step. It runs on ArcGIS Pro's Python and on a
 plain `python3` on a file server.
 
@@ -365,8 +365,9 @@ $ python cimscan.py Secrets.lyrx
 
 A repoint script rewrites the connection of each layer. For a layer in a feature dataset it can
 change the feature class name or the connection string and leave the feature dataset name behind.
-The layer then names two databases. Pro may open it, and the layers of a network built on that
-feature dataset break later, so the old database cannot be switched off with confidence.
+The layer then names two databases. The idea for this check came from a repoint that left such
+layers behind. I did not reproduce the fault in Pro, and no Esri page says what Pro does with such a
+layer, so this tool only reports the disagreement and claims nothing about how Pro reacts.
 
 What the Esri documentation says, and what the check rests on:
 
@@ -411,8 +412,10 @@ split workspaces: 2 finding(s). The names of a layer disagree about where its da
 
 Neither finding can be made from an unqualified name, because a name with no `.` names no owner and
 no database. A clean split result therefore proves nothing for such a layer, and the report says
-so instead of staying silent. A layer on a remote workspace whose `dataset` or `featureDataset`
-is unqualified is counted on a `split check:` line, and `--json` carries `splitUnchecked` on the
+so instead of staying silent. The same holds when one name carries a database part and the other
+does not, as in `warehouse2.GIS.Hydrants` beside `GIS.Water`: the owners can be compared but the
+feature dataset's database cannot. A layer on a remote workspace whose `dataset` or `featureDataset`
+is unqualified, or qualified to a different depth, is counted on a `split check:` line, and `--json` carries `splitUnchecked` on the
 source and `split_unchecked_sources` in total:
 
 ```
@@ -424,7 +427,7 @@ $ python cimscan.py Unq.lyrx
 workspaces: 2 source(s) across 1 workspace(s)
       2  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
 
-split check: 1 feature dataset layer(s) had unqualified names and could not be compared, which is not the same as clean.
+split check: 1 feature dataset layer(s) had unqualified or unequally qualified names and could not be compared, which is not the same as clean.
 
 1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 2 unknown, 0 unreadable directory(s)
 ```
@@ -682,25 +685,37 @@ Two format facts cost more time than anything else here, and both are pinned by 
   folder and gets no note. With `--diff`, the note is printed for the first `.sde` argument only.
 - Only `.aprx`, `.lyrx`, `.mapx` and `.pagx` are walked. A tree of ArcMap `.mxd` or `.lyr` files, or
   `.aptx` templates, prints `no ... documents under <dir>` and exits 0.
-- Piping the output to a program that closes early, such as `head`, raises `BrokenPipeError` with a
-  traceback and exits 1. An unexpected internal error exits 1 with a traceback, the same code as an
+- Piping a long report to a program that closes early, such as `head`, can raise `BrokenPipeError`
+  with a traceback and exit 1. A short report fits the pipe buffer and does not. An unexpected internal error exits 1 with a traceback, the same code as an
   `UNSUPPORTED` document.
 - Redaction is a denylist of key-name fragments, the ten listed above. A secret stored under a name
   with none of them prints as stored. I found no list of the keys Esri writes into a workspace
   connection string, so the list cannot be checked against one. An `Authorization: Bearer ...`
   header written with a colon has no `=` and is not redacted. An unquoted password that holds both a
   `;` and an `=` leaks the part after the `=`, because that part reads as a property of its own.
+- `--diff` compares source, definition query, renderer field and connection type only, so a change
+  to a layer's `featureDataset` alone is not reported and the pair prints `no semantic difference`.
+- Redaction does not cover `SAS=`, `jwt=` or `ticket=`, a percent-encoded `token%3D`, a token in a URL path segment, or a key
+  holding a non-word character such as `DB$PASSWORD=ab&tail`, where the text after `&` prints.
+- On Windows with Python 3.12 or earlier, a workspace written as `\??\UNC\host\share` is statted
+  without `--check-network`, because only a leading `\` or `//` counts as a network path. A hostile
+  document can make the scanning host contact a share it names. Python 3.13 prepends the drive
+  instead, so it is not affected.
+- `--apply` writes nothing. It only authorises the one outbound stat, so the name does not mean a
+  destructive step, and no flag of this tool writes a file.
+- No Esri sentence says that the Pro broken flag is reliable only after a save and reopen, so this
+  README does not state it. Scan after the save.
 - Only the workspace string and the resolved path are redacted. The dataset, layer, map and
   connection-type fields print as stored, so a dataset that is itself a URL with a token would show
   the token.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.15 and 3.13.2
-  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 329 assertions, under
-  `-W error`. 3.11 was not run for this count.
-- Branch coverage is 100 percent only with the two hosts combined: 1421 statements and 328
+  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 330 assertions, under
+  `-W error`.
+- Branch coverage is 100 percent only with the two hosts combined: 1425 statements and 330
   branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1309-1310) and Linux
-  never runs the `icacls` ones (1301-1308). Both hosts print the same assertion count, 329. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1316-1317) and Linux
+  never runs the `icacls` ones (1308-1315). Both hosts print the same assertion count, 330. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`

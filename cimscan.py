@@ -395,7 +395,8 @@ def split_findings(connection):
     qualified, as in Esri's sample 'TestDB.USER.RangerStations'. A repoint that
     rewrites one name or the connection string and leaves the other behind
     produces a layer whose names point at two databases, and a feature class
-    cannot live in a feature dataset owned by someone else. Both disagreements
+    cannot live in a feature dataset owned by someone else (this tool's
+    judgement, not an Esri-documented rule). Both disagreements
     are findings:
 
     - the two qualified names differ in the parts they both carry, and
@@ -443,8 +444,8 @@ def split_unchecked(connection):
     """True when a feature dataset layer's names could not be compared.
 
     A remote layer in a feature dataset has two names to compare, and the
-    comparison needs both to be qualified. With one or both unqualified,
-    split_findings is silent, and silence reads as a clean layer. This is the
+    comparison needs both to be qualified to the same depth. With one or both
+    unqualified, or one lacking the database part, split_findings is silent, and silence reads as a clean layer. This is the
     signal that the silence means "could not tell". A file or folder workspace
     is not counted: its names are never qualified, so there is nothing to tell.
     """
@@ -457,7 +458,13 @@ def split_unchecked(connection):
     names = [connection.get(key) for key in ("dataset", "featuredataset")]
     if not all(isinstance(n, str) and n.strip() for n in names):
         return False
-    return not all("." in n for n in names)
+    if not all("." in n for n in names):
+        return True
+    # Two qualified names of unequal depth, such as warehouse2.GIS.Hydrants
+    # against GIS.Water: the shorter one has no database part, so the layer is
+    # compared on the owner alone and the feature dataset's database is unknown.
+    first, second = (len(_qualifier(n)) for n in names)
+    return first != second
 
 
 def is_windows_absolute(path):
@@ -1092,8 +1099,8 @@ def report_lines(documents, text_filter=None, unreadable=()):
         lines.append("")
     if unchecked:
         lines.append("split check: %d feature dataset layer(s) had unqualified "
-                     "names and could not be compared, which is not the same "
-                     "as clean." % unchecked)
+                     "or unequally qualified names and could not be "
+                     "compared, which is not the same as clean." % unchecked)
         lines.append("")
     for error in unreadable:
         # Named, not only counted: what the scan does not cover is the part of
@@ -2882,7 +2889,13 @@ def self_test():
               and unchecked(FIXTURE_SQL, "Hydrants", "GIS.Water"),
               "a feature dataset layer with an unqualified name could not be "
               "compared  <-- pinned defect")
+        check(unchecked(FIXTURE_SQL, "warehouse2.GIS.Hydrants", "GIS.Water")
+              and unchecked(FIXTURE_SQL, "GIS.Hydrants", "warehouse1.GIS.Water"),
+              "a database-qualified name beside an owner-qualified one could "
+              "not be compared on the database  <-- pinned defect")
         check(not unchecked(FIXTURE_SQL, "GIS.Hydrants", "GIS.Water")
+              and not unchecked(FIXTURE_SQL, "warehouse1.GIS.Hydrants",
+                                "warehouse1.GIS.Water")
               and not unchecked("DATABASE=..\\a.gdb", "Parcels", "Roads")
               and not unchecked(FIXTURE_SQL, "Hydrants", "")
               and not split_unchecked(None)
@@ -2900,7 +2913,8 @@ def self_test():
                                       "warehouse1.GIS.Water"))]))
         code, out = run([unq_path])
         check(code == 0 and "split check: 1 feature dataset layer(s) had "
-              "unqualified names and could not be compared" in out
+              "unqualified or unequally qualified names and could not be "
+              "compared" in out
               and "split workspace" not in out,
               "the text report counts the layers it could not compare, and "
               "exits 0  <-- pinned defect")
@@ -3026,10 +3040,10 @@ def _parse(argv):
                     "and .pagx files with no ArcGIS licence, and refuse to call "
                     "an unreadable project a clean one.",
         epilog="cimscan never writes to a document. The only outbound action is "
-               "checking whether a UNC path exists, and that is off until "
-               "--apply or --check-network is passed. The share host comes "
-               "from the document, so use those flags only on documents you "
-               "trust.",
+               "checking whether a network path exists. A UNC path waits for "
+               "--apply or --check-network, but a drive letter mapped to a "
+               "share is checked without either. The share host comes from "
+               "the document, so scan only documents you trust.",
     )
     parser.add_argument("root", nargs="?",
                         help="folder to walk, or a single document")
