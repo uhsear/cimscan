@@ -103,7 +103,7 @@ class Source(object):
     """One data source, already redacted, with no file handle left open."""
 
     def __init__(self, document, container, layer, kind, dataset, dataset_type,
-                 workspace, path, present):
+                 workspace, path, present, split=()):
         self.document = document
         self.container = container
         self.layer = layer
@@ -113,6 +113,7 @@ class Source(object):
         self.workspace = workspace          # redacted at construction
         self.path = path                    # resolved, or None when not a path
         self.present = present              # True, False, or None = not checked
+        self.split = list(split)            # why its names disagree, or empty
 
     @property
     def state(self):
@@ -131,6 +132,7 @@ class Source(object):
             "workspace": self.workspace,
             "path": self.path,
             "state": self.state,
+            "split": self.split,
         }
 
     def __repr__(self):
@@ -375,6 +377,64 @@ def workspace_path(workspace):
     if REMOTE_MARKERS.intersection(props):
         return None
     return props.get("DATABASE") or None
+
+
+def _qualifier(name):
+    """The database and owner parts in front of a geodatabase object name."""
+    return [part.strip().lower() for part in name.split(".")[:-1]]
+
+
+def split_findings(connection):
+    """Why one connection's names disagree about which workspace holds the data.
+
+    A layer in a feature dataset carries two names, `dataset` for the feature
+    class and `featureDataset` for the container (Esri cim-spec,
+    CIMFeatureDatasetDataConnection). In an enterprise geodatabase each name is
+    qualified, as in Esri's sample 'TestDB.USER.RangerStations'. A repoint that
+    rewrites one name or the connection string and leaves the other behind
+    produces a layer whose names point at two databases, and a feature class
+    cannot live in a feature dataset owned by someone else. Both disagreements
+    are findings:
+
+    - the two qualified names differ in the parts they both carry, and
+    - on a SQL Server connection, a name with a database part names a database
+      other than the DATABASE property.
+
+    A name with no "." is unqualified and proves nothing, so nothing is said
+    about it. A file or folder workspace is never checked: its names are not
+    qualified, and a shapefile or CAD name holds a "." for another reason.
+    """
+    if not isinstance(connection, dict):
+        return []
+    workspace = connection.get("workspaceconnectionstring")
+    props = parse_properties(workspace) if isinstance(workspace, str) else {}
+    if not REMOTE_MARKERS.intersection(props):
+        return []
+    names = []
+    for label, key in (("dataset", "dataset"),
+                       ("feature dataset", "featuredataset")):
+        value = connection.get(key)
+        if isinstance(value, str) and "." in value:
+            names.append((label, value.strip()))
+    findings = []
+    if len(names) == 2:
+        first, second = (_qualifier(value) for _label, value in names)
+        shared = min(len(first), len(second))
+        if first[-shared:] != second[-shared:]:
+            findings.append("dataset %s and feature dataset %s name different "
+                            "workspaces" % (names[0][1], names[1][1]))
+    database = props.get("DATABASE", "").lower()
+    sqlserver = (props.get("DBCLIENT", "").lower() == "sqlserver"
+                 or props.get("INSTANCE", "").lower().startswith(
+                     "sde:sqlserver"))
+    if database and sqlserver:
+        for label, value in names:
+            parts = _qualifier(value)
+            if len(parts) >= 2 and parts[0] != database:
+                findings.append("%s %s is qualified for database %s, but the "
+                                "connection names database %s"
+                                % (label, value, parts[0], database))
+    return findings
 
 
 def is_windows_absolute(path):
@@ -687,6 +747,7 @@ def collect_sources(document, parts, roots, home, check_network,
                 workspace=redact(workspace),
                 path=redact(path) if path else path,
                 present=check_presence(path, check_network, exists),
+                split=split_findings(leaf),
             ))
     return sources
 
@@ -886,7 +947,7 @@ def find_documents(root, unreadable=None):
 def report_lines(documents, text_filter=None, unreadable=()):
     """Render the scan as the lines the CLI prints."""
     lines = []
-    total, missing, unsupported = 0, 0, 0
+    total, missing, unsupported, split_total = 0, 0, 0, 0
     everything = []
 
     for document in documents:
@@ -910,6 +971,9 @@ def report_lines(documents, text_filter=None, unreadable=()):
                 ("%s > %s" % (source.container, source.layer))[:34],
                 (source.dataset or "(no dataset)")[:24],
                 source.workspace or "(no workspace)"))
+            for finding in source.split:
+                split_total += 1
+                lines.append("   ! split workspace: %s" % finding)
         if not shown:
             lines.append("   (no data sources read)")
         lines.append("")
@@ -926,6 +990,10 @@ def report_lines(documents, text_filter=None, unreadable=()):
         lines.append("   %4d  %-8s %s"
                      % (group["count"], group["state"], label))
     lines.append("")
+    if split_total:
+        lines.append("split workspaces: %d finding(s). The names of a layer "
+                     "disagree about where its data lives." % split_total)
+        lines.append("")
     for error in unreadable:
         # Named, not only counted: what the scan does not cover is the part of
         # the tree you have to go and look at yourself.
@@ -1270,6 +1338,20 @@ def _fixture_layers_lyrx(layers):
         "type": "CIMLayerDocument",
         "layers": [d["uri"] for d in definitions],
         "layerDefinitions": definitions})
+
+
+FIXTURE_SQL = ("SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;"
+               "DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;"
+               "PASSWORD=hunter2")
+
+
+def _fixture_fd(workspace, dataset, feature_dataset):
+    """A layer in a feature dataset, as the CIM spec shapes the connection."""
+    return {"type": "CIMFeatureDatasetDataConnection",
+            "workspaceConnectionString": workspace,
+            "workspaceFactory": "SDE", "dataset": dataset,
+            "featureDataset": feature_dataset,
+            "datasetType": "esriDTFeatureClass"}
 
 
 def _fixture_join(destination):
@@ -2557,7 +2639,132 @@ def self_test():
         check(not prefix_refused("--apply") and not prefix_refused("--json"),
               "the full flag names still parse")
         check(_parse(["--diff", "a.lyrx", "b.lyrx"]).diff == ["a.lyrx", "b.lyrx"],
-              "--diff takes exactly two documents")
+              "a secret in a DATABASE= URL stays out of every output")
+
+        # ---- split workspaces: the names of one layer disagree
+        def findings(workspace, dataset, feature_dataset=None):
+            connection = _fixture_fd(workspace, dataset, feature_dataset)
+            if feature_dataset is None:
+                del connection["featureDataset"]
+            return split_findings(_lower_keys(connection))
+
+        check(findings(FIXTURE_SQL, "warehouse1.GIS.Hydrants",
+                       "warehouse1.GIS.Water") == [],
+              "a dataset and a feature dataset in one database agree")
+        stale = findings(FIXTURE_SQL, "warehouse1.GIS.Hydrants",
+                         "olddb.GIS.Water")
+        check(len(stale) == 2
+              and stale[0] == "dataset warehouse1.GIS.Hydrants and feature "
+                              "dataset olddb.GIS.Water name different "
+                              "workspaces"
+              and stale[1] == "feature dataset olddb.GIS.Water is qualified "
+                              "for database olddb, but the connection names "
+                              "database warehouse1",
+              "a feature dataset left on the old database is two findings"
+              "  <-- pinned defect")
+        old_name = findings(FIXTURE_SQL, "olddb.GIS.Hydrants")
+        check(old_name == ["dataset olddb.GIS.Hydrants is qualified for "
+                           "database olddb, but the connection names "
+                           "database warehouse1"],
+              "a repointed connection over a dataset still named for the old "
+              "database is a finding  <-- pinned defect")
+        check(len(findings(FIXTURE_SQL, "GIS.Hydrants", "SDE.Water")) == 1,
+              "two owners in one feature dataset are a finding even when no "
+              "database part is written")
+        check(findings(FIXTURE_SQL, "warehouse1.GIS.Hydrants", "Water") == []
+              and findings(FIXTURE_SQL, "Hydrants", "Water") == [],
+              "an unqualified name proves nothing and says nothing")
+        check(findings(FIXTURE_SQL, "warehouse1.GIS.Hydrants", "GIS.Water")
+              == [], "a name with an owner only agrees on the owner")
+        check(findings(FIXTURE_SQL, "WAREHOUSE1.gis.Hydrants",
+                       "Warehouse1.GIS.Water") == [],
+              "database and owner names compare without case")
+        check(findings(FIXTURE_SQL, "GIS.Hydrants") == []
+              and findings(FIXTURE_SQL, "x") == [],
+              "a two-part name carries no database to compare")
+        check(findings("DATABASE=..\\a.gdb", "Parcels.shp", "Roads.dwg")
+              == [] and findings("DATABASE=C:\\cad", "Roads", "Parcels.dwg")
+              == [],
+              "a file workspace is never checked, a dot in a CAD or shapefile "
+              "name is not a qualifier")
+        check(findings("SERVER=a;INSTANCE=sde:oracle11g:a;DATABASE=b",
+                       "x.GIS.Hydrants", "x.GIS.Water") == [],
+              "a database part is compared on SQL Server connections only")
+        check(findings("SERVER=a;INSTANCE=sde:oracle11g:a;DBCLIENT=sqlserver;"
+                       "DATABASE=b", "x.GIS.Hydrants")
+              != [] and findings("SERVER=a;INSTANCE=sde:sqlserver:a;"
+                                 "DATABASE=b", "x.GIS.Hydrants") != [],
+              "SQL Server is recognised by DBCLIENT or by INSTANCE alone")
+        check(findings("SERVER=a;DBCLIENT=sqlserver", "x.GIS.Hydrants") == [],
+              "no DATABASE property, no database comparison")
+        check(split_findings(None) == []
+              and split_findings({"workspaceconnectionstring": 5,
+                                  "dataset": "a.b.c"}) == []
+              and split_findings({"dataset": "a.b.c"}) == [],
+              "a connection with no usable workspace string says nothing")
+        check(split_findings({"workspaceconnectionstring": FIXTURE_SQL,
+                              "dataset": ["a", "b"],
+                              "featuredataset": 7}) == [],
+              "a dataset or feature dataset that is no string says nothing")
+
+        split_layers = _fixture_layers_lyrx([
+            ("Hydrants", _fixture_fd(FIXTURE_SQL, "warehouse1.GIS.Hydrants",
+                                     "olddb.GIS.Water")),
+            ("Mains", _fixture_fd(FIXTURE_SQL, "warehouse1.GIS.Mains",
+                                  "warehouse1.GIS.Water"))])
+        split_path = os.path.join(workdir, "Split.lyrx")
+        with open(split_path, "w") as handle:
+            handle.write(split_layers)
+        split_doc = scan_document(split_path)
+        check([len(s.split) for s in split_doc.sources] == [2, 0]
+              and split_doc.status == OK,
+              "scan_document carries the findings on the layer that has them")
+        code, out = run([split_path])
+        check(code == 0 and out.count("! split workspace:") == 2
+              and "split workspaces: 2 finding(s)" in out
+              and "hunter2" not in out,
+              "the text report prints each finding under its layer, no "
+              "secret, and exits 0")
+        code, out = run([split_path, "--filter", "Mains"])
+        check("split workspace" not in out,
+              "--filter hides the findings of a layer it hides")
+        code, out = run([split_path, "--json"])
+        payload = json.loads(out)["documents"][0]["sources"]
+        check([len(s["split"]) for s in payload] == [2, 0]
+              and "hunter2" not in out,
+              "--json carries the findings as a list on every source")
+        code, out = run([os.path.join(workdir, "Odd.lyrx")])
+        check("split workspace" not in out,
+              "a scan with no split prints no split line")
+        joined_split = _fixture_layers_lyrx([
+            ("Joined", {"type": "CIMRelQueryTableDataConnection",
+                        "sourceTable": _fixture_std(FIXTURE_GDB, "Parcels"),
+                        "destinationTable": _fixture_fd(
+                            FIXTURE_SQL, "olddb.GIS.Owners",
+                            "olddb.GIS.Land")})])
+        joined_path = os.path.join(workdir, "JoinedSplit.lyrx")
+        with open(joined_path, "w") as handle:
+            handle.write(joined_split)
+        check(sorted(len(s.split) for s in scan_document(joined_path).sources)
+              == [0, 2],
+              "a split inside the table a layer joins is reported on that row")
+        xml_path = os.path.join(workdir, "SplitXml.aprx")
+        archive = zipfile.ZipFile(xml_path, "w")
+        archive.writestr(
+            "Map/fd.xml",
+            '<CIMFeatureLayer xsi:type="typens:CIMFeatureLayer" %s>'
+            '<Name>Hydrants</Name>'
+            '<FeatureTable xsi:type="typens:CIMFeatureTable">'
+            '<DataConnection xsi:type="typens:CIMFeatureDatasetDataConnection">'
+            '<WorkspaceConnectionString>%s</WorkspaceConnectionString>'
+            '<Dataset>warehouse1.GIS.Hydrants</Dataset>'
+            '<FeatureDataset>olddb.GIS.Water</FeatureDataset>'
+            '</DataConnection></FeatureTable></CIMFeatureLayer>'
+            % (FIXTURE_NS, FIXTURE_SQL))
+        archive.close()
+        check([len(s.split) for s in scan_document(xml_path).sources] == [2],
+              "the XML serialisation of a feature dataset connection is read "
+              "too")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -76,8 +76,11 @@ PASS  a unique prefix of --apply is refused by the parser  <-- pinned defect
 PASS  no shorter spelling of --apply or --check-network is accepted  <-- pinned defect
 PASS  the full flag names still parse
 ...
+PASS  a feature dataset left on the old database is two findings  <-- pinned defect
+PASS  a repointed connection over a dataset still named for the old database is a finding  <-- pinned defect
+...
 --------------------------------------------------------------------
-289 assertions, 0 failed
+315 assertions, 0 failed
 ```
 
 ## Requirements
@@ -157,6 +160,8 @@ For every layer and standalone table in every document:
 - The workspace connection string, with every secret redacted.
 - The dataset it asks for, or the query name when a query layer has no dataset.
 - Whether the resolved path is on disk right now: `present`, `MISSING`, or `unknown`.
+- A `split workspace` finding when the names of one layer disagree about where its data lives. See
+  [Split workspaces](#split-workspaces).
 
 `unknown` is a third verdict on purpose. A feature service and a remote geodatabase have no local
 path to check, and calling them `MISSING` would bury the file geodatabases that really are gone.
@@ -299,6 +304,70 @@ $ python cimscan.py Secrets.lyrx
    unknown  (no map) > Svc                     x                        URL=https://h/x/FeatureServer?token=***REDACTED***&f=json
    unknown  (no map) > Db                      y                        SERVER=a;DATABASE=b;PASSWORD=***REDACTED***;USER=u
 ```
+
+## Split workspaces
+
+A repoint script rewrites the connection of each layer. For a layer in a feature dataset it can
+change the feature class name or the connection string and leave the feature dataset name behind.
+The layer then names two databases. Pro may open it, and the layers of a network built on that
+feature dataset break later, so the old database cannot be switched off with confidence.
+
+What the Esri documentation says, and what the check rests on:
+
+- A layer in a feature dataset has a `CIMFeatureDatasetDataConnection`. It is a standard data
+  connection (`workspaceConnectionString`, `dataset`) plus one string member, `featureDataset`
+  ([Esri cim-spec](https://github.com/Esri/cim-spec/blob/main/docs/v3/CIMVectorLayers.md#cimfeaturedatasetdataconnection)).
+  The connection holds one workspace string. A second workspace is not a member of it, so a split
+  cannot be a second connection string.
+- In an enterprise geodatabase, the `dataset` of a layer is a qualified name. Esri's sample reads
+  `'dataset': 'TestDB.USER.RangerStations'` beside `'database': 'TestDB'`
+  ([Updating and fixing data sources](https://pro.arcgis.com/en/pro-app/latest/arcpy/mapping/updatingandfixingdatasources.htm)).
+- The same page says that `updateConnectionProperties` "will automatically handle feature
+  datasets", and its CIM examples set `dc.featureDataset` by hand when a script edits the CIM.
+  A script that edits the CIM is the script that can leave one name behind.
+
+So a split is two names that disagree, and `cimscan` reports two kinds, each as a line under the
+layer and as a `split` list on the source in `--json`:
+
+```
+$ python cimscan.py Hydrants.lyrx
+== Hydrants.lyrx  [OK]
+   unknown  (no map) > Hydrants                warehouse1.GIS.Hydrants  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+   ! split workspace: dataset warehouse1.GIS.Hydrants and feature dataset olddb.GIS.Water name different workspaces
+   ! split workspace: feature dataset olddb.GIS.Water is qualified for database olddb, but the connection names database warehouse1
+   unknown  (no map) > Mains                   warehouse1.GIS.Mains     SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+
+workspaces: 2 source(s) across 1 workspace(s)
+      2  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+
+split workspaces: 2 finding(s). The names of a layer disagree about where its data lives.
+
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 0 unreadable directory(s)
+```
+
+1. The `dataset` and the `featureDataset` are both qualified, and the parts they both carry differ.
+   Names are compared from the right, so `GIS.Water` and `warehouse1.GIS.Hydrants` agree on the
+   owner and are not a finding. A feature class cannot sit in a feature dataset of another owner.
+2. On a SQL Server connection (`DBCLIENT=sqlserver`, or an `INSTANCE` starting `sde:sqlserver`), a
+   name with a database part names a database other than the `DATABASE` property. This is the
+   case where the repoint changed the connection and left the names.
+
+Both are quiet when they cannot tell. A name with no `.` proves nothing. A file or folder workspace
+is never checked, because a shapefile or CAD name holds a `.` for another reason. A string that
+does not look like an enterprise connection is skipped.
+
+A finding is a finding and not a failure: it does not change the exit code, like `MISSING`. The
+self-test builds each case from synthetic JSON and XML connections. Five hand-made mutations of
+the check (the name comparison, the database comparison, its length guard, the shared-part slice
+and the enterprise-connection gate) each failed at least one assertion.
+
+**Save and reopen.** The source of this idea said the broken flag Pro shows is reliable only after a
+save and a reopen. I found no sentence saying that in the Esri pages I read (the Layer class, the
+ArcGISProject class and Updating and fixing data sources), so `cimscan` does not rely on it and
+this README does not state it as fact. What is certain is narrower. `cimscan` reads the bytes on
+disk, so it sees a project only as it was last saved. Each repoint example on the update page ends
+with `saveACopy` or `save`, and a repoint that was never saved is not in the file this tool reads.
+Scan after the save, not after the script.
 
 ## An .sde on the command line
 
@@ -453,6 +522,15 @@ Two format facts cost more time than anything else here, and both are pinned by 
   `.dbconn`" as the output of the Python tool, so `.dbconn` is a second connection file type.
   `cimscan` has no rule for it and stalehost is not documented to read it, so a `.dbconn` named on
   the command line gets the old parse error rather than a pointer that might be wrong.
+- The split check reads one connection at a time. It does not compare a network layer with the
+  layers built on it, because the CIM specification pages for the network layer types list
+  only the paths of their error and dirty-area layers, not their member layers. A feature dataset that two layers of a map read from two databases, each
+  with consistent names, is not reported.
+- The split check assumes `featureDataset` is written as a qualified name when `dataset` is. The
+  specification says only "Feature dataset" and types it as a string, and no saved file with a
+  feature dataset was available here, so the case where it is written unqualified is quiet and a
+  split in it is missed. The database comparison runs on SQL Server connections only. An Oracle or
+  PostgreSQL connection gets the owner comparison between the two names and nothing else.
 - Only the first connection object of a layer is read, plus the tables nested inside it when it is a
   join. A relate to another table is not followed. A layer with no connection anywhere under it is
   skipped without a note. A layer nested more than 64 levels deep is dropped without a note.
@@ -513,13 +591,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - Only the workspace string and the resolved path are redacted. The dataset, layer, map and
   connection-type fields print as stored, so a dataset that is itself a URL with a token would show
   the token.
-- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20 and 3.13.2 on Windows
-  and on 3.12.3 on Linux, each at the same assertion count, under `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1240 statements and 282
+- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.15 and 3.13.2
+  on Windows and on 3.12.3 on Linux, each at 315 assertions, under `-W error`.
+- Branch coverage is 100 percent only with the two hosts combined: 1324 statements and 306
   branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1136-1137) and Linux
-  never runs the `icacls` ones (1128-1135). Both hosts print the same assertion count, 294. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1204-1205) and Linux
+  never runs the `icacls` ones (1196-1203). Both hosts print the same assertion count, 315. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
