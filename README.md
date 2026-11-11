@@ -90,13 +90,14 @@ PASS  a feature dataset layer with an unqualified name could not be compared  <-
 PASS  the text report counts the layers it could not compare, and exits 0  <-- pinned defect
 ...
 PASS  the footer and --json count the unknown sources, which exit 0  <-- pinned defect
+PASS  --strict turns unknown sources into exit 3  <-- pinned defect
 PASS  a stat refused for any reason but absence is unknown, not MISSING  <-- pinned defect
 ...
 PASS  a dropped feature class in a geodatabase that is there is MISSING, one the catalog cannot answer for is unknown  <-- pinned defect
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-338 assertions, 0 failed
+344 assertions, 0 failed
 ```
 
 ## Requirements
@@ -135,6 +136,7 @@ python cimscan.py --diff before.lyrx after.lyrx
 | `--diff BEFORE AFTER` | none | Compare two layer documents semantically instead of scanning a tree. Takes no folder. |
 | `--check-network` | off | Stat paths on UNC network shares. |
 | `--apply` | off | The same authorisation as `--check-network`. Nothing is ever written. The name follows the write gate of the other tools in this portfolio, and here it gates one network stat because the tool has no write to gate. |
+| `--strict` | off | Exit 3 when any shown source is `MISSING` or `unknown`, so a job does not read exit 0 as "the data is there". A `--filter` limits what it counts. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
 The UNC check is off by default because a stat against a server that is already switched off blocks
@@ -196,8 +198,8 @@ and `unknown` on every host that cannot.
 
 `unknown` is neither clean nor gone: the tool could not tell. The footer counts it beside `missing`,
 and `--json` carries `missing_sources` and `unknown_sources`. A scan whose sources are all `unknown`
-still exits 0, like a scan full of `MISSING`, so a job that needs a verdict reads the footer and
-not the exit code. A path that cannot be statted for any reason except absence is `unknown` as
+still exits 0, like a scan full of `MISSING`, because exit 0 means every document parsed. A job
+that needs a verdict passes `--strict` and gets exit 3, or reads the footer. A path that cannot be statted for any reason except absence is `unknown` as
 well. `os.path.exists` answers False for every stat failure, so a folder behind a parent the
 scanning account may not read used to print `MISSING`. Run as a non-root user on Linux, a
 `DATABASE=blocked/inner.gdb` under a folder of mode 000 now prints `unknown`.
@@ -248,9 +250,12 @@ nothing and the scan still exited 0. Each nested table is now its own row under 
 $ python cimscan.py Joined.lyrx --filter olddb
 == Joined.lyrx  [OK]
    unknown  (no map) > Parcels joined          GIS.Owners               SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
+   unknown  (no map) > Parcels joined          GIS.Parcels              SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
 
-workspaces: 1 source(s) across 1 workspace(s)
-      1  unknown  SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
+workspaces: 2 source(s) across 1 workspace(s)
+      2  unknown  SERVER=olddb;INSTANCE=sde:sqlserver:olddb;DATABASE=warehouse1
+
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 2 unknown, 0 unreadable directory(s)
 ```
 
 A plan row names the resolved path as well as the workspace string. Two projects both saying
@@ -274,14 +279,15 @@ $ python cimscan.py Dropped.lyrx
    present  (no map) > Parcels                 Parcels                  DATABASE=parcels.gdb
    MISSING  (no map) > Roads                   Roads                    DATABASE=parcels.gdb
 
-workspaces: 2 source(s) across 1 workspace(s)
-      1  MISSING  DATABASE=parcels.gdb  -> ...\parcels.gdb
-      1  present  DATABASE=parcels.gdb  -> ...\parcels.gdb
+workspaces: 2 source(s) across 2 workspace(s)
+      1  MISSING  DATABASE=parcels.gdb  -> <folder>\parcels.gdb
+      1  present  DATABASE=parcels.gdb  -> <folder>\parcels.gdb
 
 1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 1 missing, 0 unknown, 0 unreadable directory(s)
 ```
 
-The two layers share a workspace string and have two verdicts, so they are two plan rows. The
+`<folder>` stands for the absolute path of the folder the command ran in. The tool prints that path
+in full. The two layers share a workspace string and have two verdicts, so they are two plan rows. The
 catalog check answers `unknown`, not `MISSING`, whenever it cannot be sure: the folder holds no
 catalog, the catalog does not list itself, or the name is not ASCII. The format description marks
 the string encoding as uncertain ("UTF-8 ?") and says a header flag selects UTF-8 or UTF-16, so
@@ -529,7 +535,8 @@ where a credential would otherwise reach a pull request. These files are self-te
 ## Exit codes
 
 0 every document parsed and every directory listed, 1 at least one `UNSUPPORTED` or at least one
-directory that could not be listed, 2 the scan path does not exist, 64 usage error. Usage error
+directory that could not be listed, 2 the scan path does not exist, 3 `--strict` was given and a
+shown source is `MISSING` or `unknown` (exit 1 wins when both hold), 64 usage error. Usage error
 covers no root, `--diff` with a folder, and every argument the parser rejects: an unknown flag, a
 prefix such as `--ap`, `--diff` without two documents. The parser's own default for these is 2, so
 it is overridden and 2 always means a missing path. A root folder that exists and cannot be listed
@@ -647,7 +654,7 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - A drive-relative workspace such as `C:parcels.gdb` is checked against the current directory on
   that drive of the scanning host, so the verdict depends on where the scan runs.
 - A secret key name with a tab or other whitespace before the `=`, an unencoded `/` or `;` in a URL
-  password, and a secret under a name that is not on the denylist, such as `AUTH`, `COOKIE` or a
+  password, and a secret under a name that is not on the denylist, such as `AUTH`, `OAUTH`, `COOKIE` or a
   `code=` query parameter, print as stored. A `#` inside a token value ends the redacted value, so
   the text after it prints. A password that follows a line break in the connection string and holds
   `&` or `?` is redacted only up to that character.
@@ -660,9 +667,11 @@ Two format facts cost more time than anything else here, and both are pinned by 
   mapped drives, that a stat on a UNC path contacts the host, and the owner rule of a qualified
   feature dataset name. They come from running the tool, not from a Microsoft or Esri page. The
   `os.walk` `onerror` behaviour is documented by Python.
-- An unqualified `PASSWORD=ab;c=SECRETPART` redacts `ab` and keeps `c=SECRETPART`, because a chunk
-  with an `=` reads as a property of its own. This is the leak the `;` rule cannot close without
-  hiding real properties.
+- A password that holds `;` is redacted to the next known connection property. `PASSWORD=ab;c=SECRETPART;SERVER=h`
+  loses `c=SECRETPART`, because a chunk whose key is not a property name the tool knows (`SERVER`,
+  `INSTANCE`, `DATABASE`, `USER`, `AUTHENTICATION_MODE`, `DBCLIENT`, `VERSION` and a few more) is
+  taken for the rest of the password. The price is that an unlisted property written straight after
+  a password is redacted with it.
 - A UNC name in the `\\host@SSL\share` WebDAV form can make Windows contact that host over HTTPS
   when `--check-network` or `--apply` is given, if the WebClient service is running. The tool itself
   opens no socket. I could not confirm this here, because the service is stopped on the test host
@@ -725,14 +734,32 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - Only the workspace string and the resolved path are redacted. The dataset, layer, map and
   connection-type fields print as stored, so a dataset that is itself a URL with a token would show
   the token.
-- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.15 and 3.13.2
-  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 338 assertions, under
-  `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1460 statements and 340
-  branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
+- The text report counts the layers whose names could not be compared but does not name them. Run
+  `--json` and read `splitUnchecked` on each source.
+- A layer in a file geodatabase feature dataset is never compared and never counted, so silence for
+  such a layer is not a clean verdict.
+- Two layers that name the same feature dataset but carry different connection strings are not
+  compared with each other.
+- A name with more than three parts, such as a linked-server name, is compared on its first part and
+  can give a false split finding.
+- On Oracle and PostgreSQL, names that agree with each other but not with the connection are not
+  reported.
+- Redaction time grows quickly with one very long connection string that has no `;`, `&`, `?`, `#`
+  or space in it. A value of several kilobytes can stall a scan. Real connection strings are under
+  1 KB.
+- A path with a NUL character reads `MISSING`, not `unknown`. A folder name that holds `=` and no
+  `DATABASE` property is read as a property string and reads `unknown`. A rooted path with one
+  leading backslash resolves against the current drive and, on Windows, reads `MISSING` when it is absent.
+- `--diff` reports no change for a password change alone, because a stored password is redacted
+  before the two sides are compared.
+- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.12 and 3.13.2 on
+  Windows and on 3.12.3 on Linux, each at 344 assertions, under `-W error`. A Python 3.11 run was
+  not repeated.
+- Branch coverage is 100 percent only with the two hosts combined: 1482 statements and 344
+  branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1340-1341) and Linux
-  never runs the `icacls` ones (1332-1339). Both hosts print the same assertion count, 338. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1364-1365) and Linux
+  never runs the `icacls` ones (1356-1363). Both hosts print the same assertion count, 344. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`

@@ -254,6 +254,15 @@ _SECRET_PAIR = re.compile(
 # The password runs to the LAST "@" before the path, so one holding "@" goes whole.
 _USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/:@\s;?#]*):[^/\s;?#]*@")
 
+# Non-secret property names an Esri connection string carries. After a secret
+# property, a chunk with "=" is the rest of the password unless its key is on
+# this list, so an unlisted key is over-redacted and never leaked.
+_CONNECTION_KEYS = frozenset((
+    "SERVER", "INSTANCE", "DATABASE", "USER", "AUTHENTICATION_MODE",
+    "DBCLIENT", "DB_CONNECTION_PROPERTIES", "PROJECT_INSTANCE", "VERSION",
+    "BRANCH", "HISTORICAL_NAME", "HISTORICAL_TIMESTAMP", "URL", "PORTAL",
+    "CUSTOMPARAMETERS", "PROXYURL", "CONNECTION_PROPERTIES"))
+
 # A property name, as opposed to the front of a URL that holds a "?token=" key.
 _PLAIN_KEY = re.compile(r"^[\w .-]*$")
 
@@ -296,8 +305,9 @@ def redact(text):
     The string is split into properties on ";" outside quotes. A property whose
     key holds a secret marker loses its whole value, "&" and "?" included, since
     a password may contain either. A chunk with no "=" straight after such a
-    property is the rest of a password that held a ";", so it goes too. Every
-    other property is searched for NAME=value pairs with a secret name, which
+    property is the rest of a password that held a ";", so it goes too, and so
+    does a chunk with "=" whose key is no known connection property
+    (PASSWORD=ab;cd=ef). Every other property is searched for NAME=value pairs with a secret name, which
     finds a token in a service URL query string and one inside
     CUSTOMPARAMETERS=token=..., and for scheme://user:password@host. A string
     with nothing to redact comes out unchanged.
@@ -312,7 +322,8 @@ def redact(text):
                 m in key.upper() for m in SECRET_KEY_MARKERS):
             out.append("%s=%s" % (key, REDACTION))
             swallowing = True
-        elif swallowing and not sep and chunk.strip():
+        elif swallowing and chunk.strip() and (
+                not sep or key.strip().upper() not in _CONNECTION_KEYS):
             continue
         else:
             swallowing = False
@@ -1135,6 +1146,19 @@ def report_lines(documents, text_filter=None, unreadable=()):
                  % (len(documents), len(documents) - unsupported, unsupported,
                     total, missing, unknown, len(unreadable)))
     return lines
+
+
+def unverified_sources(documents, text_filter=None):
+    """How many shown sources are MISSING or unknown, the --strict count.
+
+    Exit 0 says every document parsed. It never said the data is there, and a
+    scan of nothing but remote databases reads every source as unknown. A job
+    that needs a verdict asks for --strict and gets a nonzero exit instead of
+    having to parse the footer.
+    """
+    return sum(1 for d in documents for s in d.sources
+               if matches_filter(s, text_filter)
+               and s.state in (MISSING, UNKNOWN))
 
 
 def json_report(documents, text_filter=None, root=None, unreadable=()):
@@ -2444,8 +2468,8 @@ def self_test():
               "<-- pinned defect")
         check("cd9" not in redact('PASSWORD="ab;cd9'),
               "an unclosed quote over-redacts instead of leaking")
-        apostrophe = redact("DATABASE=C:\\it's;PASSWORD=p;AUTH=1")
-        check(apostrophe == "DATABASE=C:\\it's;PASSWORD=%s;AUTH=1" % REDACTION,
+        apostrophe = redact("DATABASE=C:\\it's;PASSWORD=p;USER=u")
+        check(apostrophe == "DATABASE=C:\\it's;PASSWORD=%s;USER=u" % REDACTION,
               "an apostrophe inside a path opens no quote")
         check(redact("PASSWORD=x;") == "PASSWORD=%s;" % REDACTION,
               "an empty chunk after a secret is kept, not swallowed")
@@ -2774,6 +2798,14 @@ def self_test():
         check(redact("PASSWORD=a;b;USER=u;c")
               == "PASSWORD=%s;USER=u;c" % REDACTION,
               "a chunk after an ordinary property is kept, not swallowed")
+        tail = [redact(t) for t in (
+            "SERVER=h;DATABASE=d;USER=u;PASSWORD=ab;cd=ef",
+            "PASSWORD=Pa;ss=word;SERVER=h", "PASSWORD=a;B=C;D=E;SERVER=h")]
+        check(all(x not in "".join(tail) for x in ("ef", "word", "B=C", "D=E"))
+              and tail[1].endswith(";SERVER=h") and tail[2].endswith(";SERVER=h")
+              and tail[0].startswith("SERVER=h;DATABASE=d;USER=u;"),
+              "a password holding a semicolon and an equals sign loses the "
+              "whole tail  <-- pinned defect")
 
         # ---- usage errors exit 64, and a missing path still exits 2
         def parse_exit(argv):
@@ -2805,6 +2837,7 @@ def self_test():
         check(args.check_network is False, "--check-network defaults to OFF")
         check(args.apply is False, "--apply defaults to OFF")
         check(args.json is False, "--json defaults to OFF")
+        check(args.strict is False, "--strict defaults to OFF")
         check(args.filter is None, "--filter defaults to nothing")
         check(args.diff is None, "--diff defaults to nothing")
         check(args.root == workdir, "the scan root is read")
@@ -3011,6 +3044,22 @@ def self_test():
               and "2 unknown" in out.splitlines()[-1],
               "the footer and --json count the unknown sources, which exit 0"
               "  <-- pinned defect")
+        code, out = run([unq_path, "--strict"])
+        check(code == 3 and "strict: 2 source(s) are MISSING or unknown" in out,
+              "--strict turns unknown sources into exit 3  <-- pinned defect")
+        code, out = run([unq_path, "--strict", "--filter", "nomatchanywhere"])
+        check(code == 0 and "strict:" not in out,
+              "--strict counts only the sources --filter shows")
+        present_path = os.path.join(workdir, "Present.lyrx")
+        with open(present_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("Here", _fixture_std("DATABASE=" + workdir, "x"))]))
+        check(run([present_path, "--strict"])[0] == 0
+              and unverified_sources([scan_document(present_path)]) == 0,
+              "--strict exits 0 when every source is present")
+        check(run([os.path.join(workdir, "NoSuch.lyrx"), "--strict"])[0] == 2
+              and run([unq_path, "--strict", "--json"])[0] == 3,
+              "--strict keeps exit 2 for a missing path and works with --json")
         real_stat = os.stat
 
         def refuse(_path):
@@ -3147,6 +3196,10 @@ def _parse(argv):
     parser.add_argument("--apply", action="store_true",
                         help="authorise the one outbound action, the same as "
                              "--check-network. Nothing is ever written.")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 3 when any shown source is MISSING or "
+                             "unknown, so a job cannot read exit 0 as 'the "
+                             "data is there'")
     parser.add_argument("--self-test", dest="self_test", action="store_true",
                         help="run the offline assertions and exit")
     return parser.parse_args(argv)
@@ -3238,8 +3291,14 @@ def main(argv=None):
     # has to reach the exit code. A pipeline that only reads stdout still stops.
     # A directory the walk could not list is that same failure one level up:
     # the documents inside it were never scanned and never counted.
-    return 1 if unreadable or any(d.status == UNSUPPORTED
-                                  for d in documents) else 0
+    if unreadable or any(d.status == UNSUPPORTED for d in documents):
+        return 1
+    unverified = unverified_sources(documents, args.filter)
+    if args.strict and unverified:
+        print("strict: %d source(s) are MISSING or unknown" % unverified,
+              file=sys.stderr)
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
