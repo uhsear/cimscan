@@ -46,6 +46,8 @@ PASS  --filter finds the server hidden behind a join  <-- pinned defect
 PASS  --diff sees a repoint of the joined table  <-- pinned defect
 PASS  repointing the first of two same-named layers is reported  <-- pinned defect
 ...
+PASS  a layer whose only change is its feature dataset is reported  <-- pinned defect
+...
 PASS  --diff of two JSON files that are not CIM exits 1  <-- pinned defect
 ...
 PASS  a drive path on a POSIX host is unknown, not MISSING  <-- pinned defect
@@ -62,8 +64,13 @@ PASS  a layer the layers array does not list is still reported  <-- pinned defec
 PASS  a zip of XML that names no CIM type is UNSUPPORTED, not OK  <-- pinned defect
 ...
 PASS  a layer or map uri that is not a string still reports its layer  <-- pinned defect
+PASS  a layer reference naming no part makes the document UNSUPPORTED, not OK  <-- pinned defect
+PASS  and so does a project whose map references a missing part  <-- pinned defect
 ...
 PASS  a secret inside the resolved path is redacted too  <-- pinned defect
+PASS  a URL held in the DATABASE property is no folder path  <-- pinned defect
+PASS  a URL held in the DATABASE property is no folder path  <-- pinned defect
+PASS  so a service URL named by DATABASE reads unknown, not MISSING  <-- pinned defect
 PASS  pw, pass, sig, key, session and authorization values are redacted  <-- pinned defect
 ...
 PASS  a URL password holding an at sign is redacted whole  <-- pinned defect
@@ -89,7 +96,7 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-330 assertions, 0 failed
+338 assertions, 0 failed
 ```
 
 ## Requirements
@@ -133,9 +140,11 @@ python cimscan.py --diff before.lyrx after.lyrx
 The UNC check is off by default because a stat against a server that is already switched off blocks
 for the full SMB timeout. One stat on an unreachable documentation-range address (192.0.2.1) took
 21 seconds on the Windows host here, so three hundred layers on a decommissioned box cost about
-two hours. Local paths are always checked; only the network round trip needs the flag. The share
-host is read from the document, and Windows connects to it to answer the stat. Use
-`--check-network` and `--apply` only on documents you trust.
+two hours. Local paths are checked without the flag, and so is a drive letter mapped to a share (see
+Limits); the flag gates the `\host` and `//host` round trip. The share host is read from the
+document, and Windows connects to it to answer the stat. That connection can send the scanning
+account's NTLM credentials to the host the document names, so use `--check-network` and `--apply`
+only on documents you trust.
 
 The parser refuses abbreviated flags (`allow_abbrev=False`). `--ap` is an error and not `--apply`,
 so the one flag that authorises an outbound action cannot be typed by accident. The parser exits 64
@@ -287,7 +296,9 @@ a name that the catalog lists.
 
 It refuses to report an unreadable document as a clean one. A document whose container will not
 open, whose parts will not parse, that holds no CIM parts at all, or whose root object, or every zipped part, names no CIM
-type, is marked `UNSUPPORTED`, counted separately, and drives the exit code to 1.
+type, is marked `UNSUPPORTED`, counted separately, and drives the exit code to 1. So is a document
+with a layer reference that names a part the document does not contain, as in a damaged project: the
+note names the reference, because the layers behind it were not read.
 
 ```
 $ python cimscan.py mixed
@@ -454,7 +465,7 @@ Scan after the save, not after the script.
 An `.sde` is not a CIM document. The Create Database Connection tool summary reads "Creates a file
 that ArcGIS uses to connect to a database, a cloud data warehouse, or an enterprise geodatabase".
 Its `out_name` parameter says "The output file will have the .sde extension", and its output is
-"The output database connection file ( .sde or .dbconn )"
+"The output database connection file (.sde or .dbconn)"
 ([Esri documentation](https://pro.arcgis.com/en/pro-app/3.5/tool-reference/data-management/create-database-connection.htm)).
 Before this note existed, an `.sde` handed to `cimscan` went to the XML parser and came back as
 `part Prod.sde did not parse: not well-formed (invalid token)`. That was true, and it told the
@@ -492,8 +503,8 @@ appears only when you name the file yourself, so a folder that holds only `.sde`
 
 A `.lyrx` is a whole JSON document for one layer, and a real one runs to hundreds of lines. Saving
 the same layer again rewrites its uri, so a textual diff reports a change that means nothing. The
-diff compares four things, which is what a layer review is about: source, definition query,
-renderer field and connection type. A layer is matched by name. Two layers with the same name are
+diff compares five things, which is what a layer review is about: source, feature dataset,
+definition query, renderer field and connection type. A layer is matched by name. Two layers with the same name are
 told apart by their order, the second being `Name (#2)`, so a repoint of the first is not lost
 behind the second. A joined layer compares by all of its tables.
 
@@ -576,7 +587,7 @@ Two format facts cost more time than anything else here, and both are pinned by 
   in `standaloneTableDefinitions`. All three members are read, so a layer reports the map that holds
   it and a standalone table is not dropped. A layout element that carries its own source, instead of
   framing a map, is not specially handled.
-- The diff compares source, definition query, renderer field and connection type. It says nothing
+- The diff compares source, feature dataset, definition query, renderer field and connection type. It says nothing
   about symbology, labelling, pop-ups or scale ranges. It ignores group nesting: a layer moved from
   one group to another is not a change.
 - It never writes to a document and never repairs one. Repointing a broken layer is
@@ -606,6 +617,12 @@ Two format facts cost more time than anything else here, and both are pinned by 
   layers built on it, because the CIM specification pages for the network layer types list
   only the paths of their error and dirty-area layers, not their member layers. A feature dataset that two layers of a map read from two databases, each
   with consistent names, is not reported.
+- The database comparison also runs on layers that have no feature dataset, so a split line does not
+  always mean a feature dataset layer.
+- Bracket-quoted name parts are not unquoted before comparison; Pro was not seen to write them, so
+  `[wh1].dbo.FD` against `wh1` gives a false split finding.
+- Two dataset names that are both `owner.name` with no database part, such as `GIS.Hydrants` and
+  `GIS.Water`, are compared on the owner alone and give no split line.
 - The split check assumes `featureDataset` is written as a qualified name when `dataset` is. The
   specification says only "Feature dataset" and types it as a string, and no saved file with a
   feature dataset was available here. When either name is unqualified the layer is counted on the
@@ -637,8 +654,8 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - The text report prints layer names, workspaces and notes as stored, so a hostile document can
   forge report lines or send terminal escape codes. Use `--json`, which escapes them, or scan
   trusted files.
-- A layer reference that names a part the document does not contain, as in a damaged project, is
-  skipped without a note, so such a project can report `OK`.
+- Two layer parts that carry the same `uri` in one `.lyrx` overwrite each other, and the last one
+  is read.
 - Several behaviours here have no vendor citation: that a scheduled task does not see a user's
   mapped drives, that a stat on a UNC path contacts the host, and the owner rule of a qualified
   feature dataset name. They come from running the tool, not from a Microsoft or Esri page. The
@@ -656,8 +673,10 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - An `.aprx` with no layers reports `OK` with no sources, the same as one whose layer types the tool
   does not recognise.
 - A workspace string is a remote database, not a folder, when it carries `SERVER`, `INSTANCE`,
-  `DBCLIENT` or `DB_CONNECTION_PROPERTIES`. A string with only a `DATABASE` property, as a cloud
-  warehouse connection might write, is still treated as a folder path and reported `MISSING`. The
+  `DBCLIENT` or `DB_CONNECTION_PROPERTIES`. A string with only a `DATABASE` property is still treated as a folder path and
+  reported `MISSING`, unless the value is a URL of any scheme, which reads `unknown`. A string that
+  points at an `.sde` file, with no `SERVER` or `INSTANCE` property, is read as a path, so a split
+  between its dataset and feature dataset is neither reported nor counted as unchecked. The
   property names Pro writes for each database platform are not listed in Esri's documentation, so
   that list is read from saved files and could not be checked offline.
 - A drive letter mapped to a network share is treated as a local path and statted even without
@@ -693,8 +712,6 @@ Two format facts cost more time than anything else here, and both are pinned by 
   connection string, so the list cannot be checked against one. An `Authorization: Bearer ...`
   header written with a colon has no `=` and is not redacted. An unquoted password that holds both a
   `;` and an `=` leaks the part after the `=`, because that part reads as a property of its own.
-- `--diff` compares source, definition query, renderer field and connection type only, so a change
-  to a layer's `featureDataset` alone is not reported and the pair prints `no semantic difference`.
 - Redaction does not cover `SAS=`, `jwt=` or `ticket=`, a percent-encoded `token%3D`, a token in a URL path segment, or a key
   holding a non-word character such as `DB$PASSWORD=ab&tail`, where the text after `&` prints.
 - On Windows with Python 3.12 or earlier, a workspace written as `\??\UNC\host\share` is statted
@@ -709,13 +726,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
   connection-type fields print as stored, so a dataset that is itself a URL with a token would show
   the token.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.15 and 3.13.2
-  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 330 assertions, under
+  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 338 assertions, under
   `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1425 statements and 330
+- Branch coverage is 100 percent only with the two hosts combined: 1460 statements and 340
   branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1316-1317) and Linux
-  never runs the `icacls` ones (1308-1315). Both hosts print the same assertion count, 330. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1340-1341) and Linux
+  never runs the `icacls` ones (1332-1339). Both hosts print the same assertion count, 338. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`

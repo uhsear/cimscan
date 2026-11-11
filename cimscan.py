@@ -378,7 +378,11 @@ def workspace_path(workspace):
     props = parse_properties(workspace)
     if REMOTE_MARKERS.intersection(props):
         return None
-    return props.get("DATABASE") or None
+    database = props.get("DATABASE") or None
+    # The same rule for a URL held in the DATABASE property.
+    if database and _SCHEME.match(database.strip()):
+        return None
+    return database
 
 
 def _qualifier(name):
@@ -751,7 +755,7 @@ def document_parts(root):
     return (parts, roots or sorted(parts))
 
 
-def walk_layers(parts, roots, visited=None):
+def walk_layers(parts, roots, visited=None, dangling=None):
     """Return (container, name, node) for every layer reachable from the roots.
 
     Recursion is what finds a layer buried three group layers deep. Both
@@ -762,6 +766,10 @@ def walk_layers(parts, roots, visited=None):
     second walk that starts with an empty one reports every part the first walk
     already reached, which is how a layer held by a map and by an unreferenced
     group part was counted twice.
+
+    A reference that names no part is appended to the optional dangling list. A
+    damaged project drops those layers, and dropping them without a word reads
+    as a project with nothing to report.
     """
     found = []
     if visited is None:
@@ -773,7 +781,11 @@ def walk_layers(parts, roots, visited=None):
         node = reference
         if isinstance(reference, str):
             key = part_key(parts, reference)
-            if key is None or key in visited:
+            if key is None:
+                if dangling is not None and reference:
+                    dangling.append(reference)
+                return
+            if key in visited:
                 return
             visited.add(key)
             node = parts[key]
@@ -797,7 +809,7 @@ def walk_layers(parts, roots, visited=None):
 
 
 def collect_sources(document, parts, roots, home, check_network,
-                    exists=path_exists, catalog=read_catalog):
+                    exists=path_exists, catalog=read_catalog, dangling=None):
     """Turn a parsed document into its Source records.
 
     Maps are walked first so every layer is attributed to the map that holds it,
@@ -812,13 +824,14 @@ def collect_sources(document, parts, roots, home, check_network,
     map_roots = [n for n in sorted(parts)
                  if isinstance(parts[n], dict)
                  and str(parts[n].get("type", "")) in ("CIMMap", "CIMLayout")]
-    layers, visited = walk_layers(parts, map_roots + list(roots))
+    layers, visited = walk_layers(parts, map_roots + list(roots),
+                                  dangling=dangling)
 
     leftovers = [n for n in sorted(parts) if n not in visited]
     if leftovers:
         # The same visited set, or a layer that a map and an unreferenced group
         # part both reference comes back twice and inflates every count below.
-        extra, _visited = walk_layers(parts, leftovers, visited)
+        extra, _visited = walk_layers(parts, leftovers, visited, dangling)
         layers.extend(extra)
 
     for container, name, node in layers:
@@ -890,9 +903,13 @@ def matches_filter(source, text):
 
 
 def layer_signature(node):
-    """The four things a .lyrx pull request is actually about."""
+    """The five things a .lyrx pull request is actually about."""
     outer = find_connection(node)
     kind = connection_facts(outer)[0]
+    container = " + ".join(
+        leaf["featuredataset"] for leaf in leaf_connections(outer)
+        if isinstance(leaf, dict)
+        and isinstance(leaf.get("featuredataset"), str))
     source = " + ".join(
         "%s|%s" % (redact(w), d) for _k, w, d, _t in
         (connection_facts(leaf) for leaf in leaf_connections(outer)))
@@ -908,6 +925,7 @@ def layer_signature(node):
             field = ", ".join(str(f) for f in as_list(renderer.get("fields")))
     return {
         "source": source,
+        "featureDataset": container,
         "connection": kind,
         "definitionQuery": query,
         "rendererField": field,
@@ -920,7 +938,7 @@ def diff_documents(before, after):
     A .lyrx is a whole JSON document for one layer, and a real one
     runs to hundreds of lines. Re-saving one in Pro rewrites its uri, so a
     textual diff reports a change even when nothing a reviewer cares about
-    moved. These four fields are what the review is actually about.
+    moved. These five fields are what the review is actually about.
     """
     def summaries(root):
         parts, roots = document_parts(root)
@@ -937,6 +955,7 @@ def diff_documents(before, after):
 
     old, new = summaries(before), summaries(after)
     labels = [("source", "source repointed"),
+              ("featureDataset", "feature dataset changed"),
               ("definitionQuery", "definition query changed"),
               ("rendererField", "renderer field changed"),
               ("connection", "connection type changed")]
@@ -1011,7 +1030,12 @@ def scan_document(path, check_network=False, exists=path_exists):
             notes.append("no part is a CIM document")
         parts, roots = parsed, sorted(parsed)
 
-    sources = collect_sources(path, parts, roots, home, check_network, exists)
+    dangling = []
+    sources = collect_sources(path, parts, roots, home, check_network, exists,
+                              dangling=dangling)
+    for reference in sorted(set(dangling)):
+        notes.append("a layer reference names no part of the document: %s"
+                     % reference)
 
     # A document with an unparsed part is UNSUPPORTED even when some layers were
     # read, because the sources reported are a floor and not the whole truth.
@@ -1141,8 +1165,8 @@ def json_report(documents, text_filter=None, root=None, unreadable=()):
 def diff_lines(changes):
     """Render a semantic diff as the lines the CLI prints."""
     if not changes:
-        return ["no semantic difference: source, definition query, renderer "
-                "field and connection type all match"]
+        return ["no semantic difference: source, feature dataset, definition "
+                "query, renderer field and connection type all match"]
     lines = []
     for kind, layer, before, after in changes:
         lines.append("%s: %s" % (kind, layer))
@@ -1910,7 +1934,7 @@ def self_test():
         check(odd_layers[0][1] == "(unnamed)",
               "a layer name that is not text reads as unnamed, it does not raise")
 
-        # ---- the four fields a .lyrx review is about
+        # ---- the five fields a .lyrx review is about
         multi = parse_cim(json.dumps({
             "type": "CIMFeatureLayer", "name": "Zoning",
             "renderer": {"type": "CIMUniqueValueRenderer",
@@ -1922,6 +1946,26 @@ def self_test():
               "a layer with no feature table has no definition query")
         check(layer_signature({})["connection"] == "unknown",
               "a layer with no connection signs as unknown rather than raising")
+
+        # ---- a repoint of the feature dataset name alone is a change
+        def fd_layer(container):
+            return {"type": "CIMFeatureLayer", "name": "Hydrants",
+                    "featureTable": {"dataConnection": {
+                        "type": "CIMFeatureDatasetDataConnection",
+                        "workspaceConnectionString": "DATABASE=wh1",
+                        "dataset": "wh1.dbo.A",
+                        "featureDataset": container}}}
+        fd_changes = diff_documents(
+            parse_cim(json.dumps(fd_layer("wh1.dbo.FD_old"))),
+            parse_cim(json.dumps(fd_layer("wh1.dbo.FD_new"))))
+        check(fd_changes == [("feature dataset changed", "Hydrants",
+                              "wh1.dbo.FD_old", "wh1.dbo.FD_new")],
+              "a layer whose only change is its feature dataset is reported"
+              "  <-- pinned defect")
+        check(not diff_documents(
+            parse_cim(json.dumps(fd_layer("wh1.dbo.FD_old"))),
+            parse_cim(json.dumps(fd_layer("wh1.dbo.FD_old")))),
+              "and the same feature dataset on both sides is no change")
 
         # ---- one workspace string, two projects, two plan rows
         gone = os.path.join(workdir, "p2", "common", "x.gdb")
@@ -2639,6 +2683,33 @@ def self_test():
               "a layer or map uri that is not a string still reports its layer"
               "  <-- pinned defect")
 
+        # ---- a reference to a part the document lacks is a note, not silence
+        gone_path = os.path.join(workdir, "NoDefinition.lyrx")
+        with open(gone_path, "w") as handle:
+            json.dump({"type": "CIMLayerDocument",
+                       "layers": ["CIMPATH=Gone.json"],
+                       "layerDefinitions": []}, handle)
+        gone_doc = scan_document(gone_path)
+        check(gone_doc.status == UNSUPPORTED and gone_doc.sources == []
+              and "Gone.json" in gone_doc.notes[0],
+              "a layer reference naming no part makes the document "
+              "UNSUPPORTED, not OK  <-- pinned defect")
+        gone_zip = os.path.join(workdir, "Missing.aprx")
+        with zipfile.ZipFile(gone_zip, "w") as archive:
+            archive.writestr("Index.json", json.dumps(
+                {"type": "CIMProject", "version": "3.6.0"}))
+            archive.writestr("map/map.json", json.dumps(
+                {"type": "CIMMap", "name": "M",
+                 "layers": ["CIMPATH=Map/Gone.json"]}))
+        check(scan_document(gone_zip).status == UNSUPPORTED,
+              "and so does a project whose map references a missing part  "
+              "<-- pinned defect")
+        walk_dangling = []
+        walk_layers({"a": {"type": "CIMGroupLayer", "layers": ["b", ""]}},
+                    ["a"], dangling=walk_dangling)
+        check(walk_dangling == ["b"],
+              "an empty reference is not reported as dangling")
+
         # ---- fields read from a hostile or odd connection
         check(connection_facts({"type": "CIMStandardDataConnection",
                                 "workspaceconnectionstring": 5,
@@ -2658,12 +2729,23 @@ def self_test():
         secret_path = os.path.join(workdir, "SecretPath.lyrx")
         with open(secret_path, "w") as handle:
             handle.write(_fixture_layers_lyrx([
-                ("S", _fixture_std("DATABASE=https://h/x?token=TOKX", "x"))]))
+                ("S", _fixture_std("DATABASE=data/x.gdb?token=TOKX", "x"))]))
         secret_doc = scan_document(secret_path)
         shown = json.dumps(json_report([secret_doc])) + "".join(
             report_lines([secret_doc]))
         check("TOKX" not in shown and REDACTION in secret_doc.sources[0].path,
               "a secret inside the resolved path is redacted too"
+              "  <-- pinned defect")
+        for url_database in ("https://h/x?token=TOKX", "s3://bucket/k.gdb"):
+            check(workspace_path("DATABASE=" + url_database) is None,
+                  "a URL held in the DATABASE property is no folder path  "
+                  "<-- pinned defect")
+        url_path = os.path.join(workdir, "UrlDatabase.lyrx")
+        with open(url_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("D", _fixture_std("DATABASE=https://h/x?token=TOKX", "x"))]))
+        check(scan_document(url_path).sources[0].state == UNKNOWN,
+              "so a service URL named by DATABASE reads unknown, not MISSING"
               "  <-- pinned defect")
 
         # ---- credential spellings the first denylist missed
