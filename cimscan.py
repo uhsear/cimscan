@@ -51,7 +51,7 @@ CIM_PART_EXTENSIONS = (".xml", ".json")
 # Extensions that name a real ArcGIS file this tool does not read. The value is
 # the whole note, so the user learns the file type and where to go next. An
 # .sde is a database connection file (Esri: "a file that ArcGIS uses to connect
-# to a database"), not a CIM document, and stalehost reads it as bytes.
+# to a database"), not a CIM document, and stalehost is the tool that handles it.
 NOT_CIM = {
     ".sde": "an .sde is an ArcGIS database connection file, not a CIM "
             "document, so cimscan does not open it. To find a stale host in "
@@ -103,7 +103,7 @@ class Source(object):
     """One data source, already redacted, with no file handle left open."""
 
     def __init__(self, document, container, layer, kind, dataset, dataset_type,
-                 workspace, path, present, split=()):
+                 workspace, path, present, split=(), split_unchecked=False):
         self.document = document
         self.container = container
         self.layer = layer
@@ -114,6 +114,7 @@ class Source(object):
         self.path = path                    # resolved, or None when not a path
         self.present = present              # True, False, or None = not checked
         self.split = list(split)            # why its names disagree, or empty
+        self.split_unchecked = split_unchecked   # names could not be compared
 
     @property
     def state(self):
@@ -133,6 +134,7 @@ class Source(object):
             "path": self.path,
             "state": self.state,
             "split": self.split,
+            "splitUnchecked": self.split_unchecked,
         }
 
     def __repr__(self):
@@ -437,6 +439,27 @@ def split_findings(connection):
     return findings
 
 
+def split_unchecked(connection):
+    """True when a feature dataset layer's names could not be compared.
+
+    A remote layer in a feature dataset has two names to compare, and the
+    comparison needs both to be qualified. With one or both unqualified,
+    split_findings is silent, and silence reads as a clean layer. This is the
+    signal that the silence means "could not tell". A file or folder workspace
+    is not counted: its names are never qualified, so there is nothing to tell.
+    """
+    if not isinstance(connection, dict):
+        return False
+    workspace = connection.get("workspaceconnectionstring")
+    props = parse_properties(workspace) if isinstance(workspace, str) else {}
+    if not REMOTE_MARKERS.intersection(props):
+        return False
+    names = [connection.get(key) for key in ("dataset", "featuredataset")]
+    if not all(isinstance(n, str) and n.strip() for n in names):
+        return False
+    return not all("." in n for n in names)
+
+
 def is_windows_absolute(path):
     r"""True for a drive-letter or UNC path, whatever host is reading it.
 
@@ -485,7 +508,24 @@ def is_network_path(path):
     return path.startswith("\\\\") or path.startswith("//")
 
 
-def check_presence(path, check_network, exists=os.path.exists,
+def path_exists(path):
+    """True, False, or None when the stat failed for a reason other than absence.
+
+    os.path.exists answers False for every stat failure, a refused read of a
+    parent folder included, and the report then says MISSING about data that is
+    there. Only "no such file or directory" means absent. A path that cannot
+    exist, such as one holding a NUL character, is absent too.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def check_presence(path, check_network, exists=path_exists,
                    windows=os.name == "nt"):
     """Presence for a resolved path: True, False, or None when not checked.
 
@@ -511,7 +551,8 @@ def check_presence(path, check_network, exists=os.path.exists,
         # A drive letter this session does not have, such as a user's mapped
         # share seen from a scheduled task, cannot be evaluated either.
         return None
-    return bool(exists(path))
+    found = exists(path)
+    return None if found is None else bool(found)
 
 
 def not_cim_note(path):
@@ -523,6 +564,46 @@ def not_cim_note(path):
     credential and none of its bytes are needed to name it.
     """
     return NOT_CIM.get(os.path.splitext(path or "")[1].lower())
+
+
+def dataset_in_catalog(catalog, dataset):
+    """Whether a file geodatabase catalog names a dataset: True, False, or None.
+
+    The catalog is the geodatabase's first table, a00000001.gdbtable. A row's
+    Name is a string stored as its byte length and then its characters. The
+    open file geodatabase format description calls the encoding "UTF-8 ?" and
+    says a flag in the table header selects UTF-8 or UTF-16, so both spellings
+    are tried. The entry is looked for with its length byte in front, so
+    "Parcels" is not found inside "Parcels_old". A catalog that does not list
+    itself, GDB_SystemCatalog, in either spelling is not one this reads. A name
+    that is not ASCII cannot be matched here. Each of those answers None. A
+    dropped row can leave its bytes behind, so True means "listed or recently
+    dropped" and False means "not listed". The length is a varuint, one byte
+    below 128 and two above.
+    """
+    name = (dataset or "").rsplit(".", 1)[-1].strip()
+    if catalog is None or not name or not name.isascii():
+        return None
+    catalog = catalog.lower()
+    for encoding in ("utf-8", "utf-16-le"):
+        def listed(text):
+            raw = text.encode(encoding)
+            size = len(raw)
+            head = bytes([size]) if size < 128 else bytes(
+                [size & 0x7F | 0x80, size >> 7])
+            return head + raw in catalog
+        if listed("gdb_systemcatalog"):
+            return listed(name.lower())
+    return None
+
+
+def read_catalog(path):
+    """The bytes of a file geodatabase's catalog table, or None if unreadable."""
+    try:
+        with open(os.path.join(path, "a00000001.gdbtable"), "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
 
 
 def is_cim_root(root):
@@ -709,13 +790,16 @@ def walk_layers(parts, roots, visited=None):
 
 
 def collect_sources(document, parts, roots, home, check_network,
-                    exists=os.path.exists):
+                    exists=path_exists, catalog=read_catalog):
     """Turn a parsed document into its Source records.
 
     Maps are walked first so every layer is attributed to the map that holds it,
     then any part left unvisited is swept up. An unreferenced layer part is
     still a live reference to a database, and a decommissioning plan that skips
     it is wrong.
+
+    A file geodatabase that is there is also asked whether it lists the dataset,
+    because a dropped feature class leaves the folder behind.
     """
     sources = []
     map_roots = [n for n in sorted(parts)
@@ -737,6 +821,9 @@ def collect_sources(document, parts, roots, home, check_network,
         for leaf in leaf_connections(connection):
             kind, workspace, dataset, dataset_type = connection_facts(leaf)
             path = resolve(workspace_path(workspace), home)
+            present = check_presence(path, check_network, exists)
+            if present and path.lower().endswith(".gdb") and dataset:
+                present = dataset_in_catalog(catalog(path), dataset)
             sources.append(Source(
                 document=document,
                 container=container or "(no map)",
@@ -746,8 +833,9 @@ def collect_sources(document, parts, roots, home, check_network,
                 dataset_type=dataset_type,
                 workspace=redact(workspace),
                 path=redact(path) if path else path,
-                present=check_presence(path, check_network, exists),
+                present=present,
                 split=split_findings(leaf),
+                split_unchecked=split_unchecked(leaf),
             ))
     return sources
 
@@ -764,11 +852,14 @@ def group_by_workspace(sources):
     the text alone merged them into one row carrying whichever verdict came
     first. A geodatabase that was gone then hid behind a row reading "present",
     which is the one answer this tool exists not to give.
+
+    The verdict is part of the key too: two datasets in one file geodatabase can
+    differ, one listed and one dropped, and a row cannot carry both words.
     """
     groups = {}
     for source in sources:
         name = source.workspace or "(no workspace)"
-        key = (name, source.path or "")
+        key = (name, source.path or "", source.state)
         entry = groups.get(key)
         if entry is None:
             entry = {"workspace": name, "path": source.path,
@@ -877,7 +968,7 @@ def read_parts(path):
         return {os.path.basename(path): handle.read()}
 
 
-def scan_document(path, check_network=False, exists=os.path.exists):
+def scan_document(path, check_network=False, exists=path_exists):
     """Scan one document. Never raises; an unreadable one becomes UNSUPPORTED."""
     home = os.path.dirname(os.path.abspath(path))
     named = not_cim_note(path)
@@ -947,7 +1038,8 @@ def find_documents(root, unreadable=None):
 def report_lines(documents, text_filter=None, unreadable=()):
     """Render the scan as the lines the CLI prints."""
     lines = []
-    total, missing, unsupported, split_total = 0, 0, 0, 0
+    total, missing, unknown, unsupported, split_total = 0, 0, 0, 0, 0
+    unchecked = 0
     everything = []
 
     for document in documents:
@@ -966,6 +1058,10 @@ def report_lines(documents, text_filter=None, unreadable=()):
             total += 1
             if source.state == MISSING:
                 missing += 1
+            elif source.state == UNKNOWN:
+                unknown += 1
+            if source.split_unchecked:
+                unchecked += 1
             lines.append("   %-8s %-34s %-24s %s" % (
                 source.state,
                 ("%s > %s" % (source.container, source.layer))[:34],
@@ -994,14 +1090,19 @@ def report_lines(documents, text_filter=None, unreadable=()):
         lines.append("split workspaces: %d finding(s). The names of a layer "
                      "disagree about where its data lives." % split_total)
         lines.append("")
+    if unchecked:
+        lines.append("split check: %d feature dataset layer(s) had unqualified "
+                     "names and could not be compared, which is not the same "
+                     "as clean." % unchecked)
+        lines.append("")
     for error in unreadable:
         # Named, not only counted: what the scan does not cover is the part of
         # the tree you have to go and look at yourself.
         lines.append("!! cannot list %s: %s" % (error.filename, error.strerror))
     lines.append("%d document(s), %d OK, %d UNSUPPORTED, %d source(s), "
-                 "%d missing, %d unreadable directory(s)"
+                 "%d missing, %d unknown, %d unreadable directory(s)"
                  % (len(documents), len(documents) - unsupported, unsupported,
-                    total, missing, len(unreadable)))
+                    total, missing, unknown, len(unreadable)))
     return lines
 
 
@@ -1023,6 +1124,10 @@ def json_report(documents, text_filter=None, root=None, unreadable=()):
     return {"root": root,
             "documents": payload,
             "workspaces": group_by_workspace(shown),
+            "missing_sources": sum(1 for s in shown if s.state == MISSING),
+            "unknown_sources": sum(1 for s in shown if s.state == UNKNOWN),
+            "split_unchecked_sources": sum(1 for s in shown
+                                           if s.split_unchecked),
             "unreadable_directories": [e.filename for e in unreadable]}
 
 
@@ -2459,8 +2564,9 @@ def self_test():
                                           make_source("C", None, None)], [])
         lines = report_lines([counted])
         check(lines[-1] == "1 document(s), 1 OK, 0 UNSUPPORTED, 3 source(s), "
-              "1 missing, 0 unreadable directory(s)",
-              "the footer counts every source and only the MISSING ones"
+              "1 missing, 1 unknown, 0 unreadable directory(s)",
+              "the footer counts every source, the MISSING ones and the "
+              "unknown ones"
               "  <-- pinned defect")
         check("workspaces: 3 source(s) across 3 workspace(s)" in lines,
               "the workspace summary counts the same sources")
@@ -2475,7 +2581,7 @@ def self_test():
         lines = report_lines([bare])
         check("   (no data sources read)" in lines and lines[-1]
               == "1 document(s), 1 OK, 0 UNSUPPORTED, 0 source(s), "
-              "0 missing, 0 unreadable directory(s)",
+              "0 missing, 0 unknown, 0 unreadable directory(s)",
               "a document with no sources says so and adds nothing to the footer"
               "  <-- pinned defect")
 
@@ -2639,7 +2745,7 @@ def self_test():
         check(not prefix_refused("--apply") and not prefix_refused("--json"),
               "the full flag names still parse")
         check(_parse(["--diff", "a.lyrx", "b.lyrx"]).diff == ["a.lyrx", "b.lyrx"],
-              "a secret in a DATABASE= URL stays out of every output")
+              "--diff takes exactly two documents")
 
         # ---- split workspaces: the names of one layer disagree
         def findings(workspace, dataset, feature_dataset=None):
@@ -2765,6 +2871,133 @@ def self_test():
         check([len(s.split) for s in scan_document(xml_path).sources] == [2],
               "the XML serialisation of a feature dataset connection is read "
               "too")
+
+        # ---- a layer whose names could not be compared says so
+        def unchecked(workspace, dataset, feature_dataset):
+            return split_unchecked(_lower_keys(
+                _fixture_fd(workspace, dataset, feature_dataset)))
+
+        check(unchecked(FIXTURE_SQL, "Hydrants", "Water")
+              and unchecked(FIXTURE_SQL, "warehouse1.GIS.Hydrants", "Water")
+              and unchecked(FIXTURE_SQL, "Hydrants", "GIS.Water"),
+              "a feature dataset layer with an unqualified name could not be "
+              "compared  <-- pinned defect")
+        check(not unchecked(FIXTURE_SQL, "GIS.Hydrants", "GIS.Water")
+              and not unchecked("DATABASE=..\\a.gdb", "Parcels", "Roads")
+              and not unchecked(FIXTURE_SQL, "Hydrants", "")
+              and not split_unchecked(None)
+              and not split_unchecked({"workspaceconnectionstring": 5,
+                                       "dataset": "a", "featuredataset": "b"})
+              and not split_unchecked({"workspaceconnectionstring": FIXTURE_SQL,
+                                       "dataset": "a"}),
+              "two qualified names, a file workspace, no feature dataset and "
+              "no usable connection are not counted")
+        unq_path = os.path.join(workdir, "Unq.lyrx")
+        with open(unq_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("Hydrants", _fixture_fd(FIXTURE_SQL, "Hydrants", "Water")),
+                ("Mains", _fixture_fd(FIXTURE_SQL, "warehouse1.GIS.Mains",
+                                      "warehouse1.GIS.Water"))]))
+        code, out = run([unq_path])
+        check(code == 0 and "split check: 1 feature dataset layer(s) had "
+              "unqualified names and could not be compared" in out
+              and "split workspace" not in out,
+              "the text report counts the layers it could not compare, and "
+              "exits 0  <-- pinned defect")
+        payload = json.loads(run([unq_path, "--json"])[1])
+        check(payload["split_unchecked_sources"] == 1
+              and [s["splitUnchecked"] for s
+                   in payload["documents"][0]["sources"]] == [True, False],
+              "--json carries the count and the flag on the layer")
+
+        # ---- unknown is counted, and a stat that fails is not MISSING
+        check(payload["unknown_sources"] == 2 and payload["missing_sources"] == 0
+              and "2 unknown" in out.splitlines()[-1],
+              "the footer and --json count the unknown sources, which exit 0"
+              "  <-- pinned defect")
+        real_stat = os.stat
+
+        def refuse(_path):
+            raise PermissionError(13, "Permission denied")
+        os.stat = refuse
+        try:
+            denied = path_exists(workdir)
+        finally:
+            os.stat = real_stat
+        check(denied is None and path_exists(workdir) is True
+              and path_exists(os.path.join(workdir, "no-such-x")) is False
+              and path_exists(workdir + "\0x") is False,
+              "a stat refused for any reason but absence is unknown, not "
+              "MISSING  <-- pinned defect")
+        check(check_presence(workdir, False, lambda _p: None) is None,
+              "check_presence passes an unknown stat on")
+
+        # ---- a file geodatabase that is there but no longer lists the dataset
+        def catalog(*names):
+            return b"".join(
+                (bytes([len(n)]) if len(n) < 128 else bytes(
+                    [len(n) & 0x7F | 0x80, len(n) >> 7]))
+                + n.encode("ascii") + b"\0\0"
+                for n in ("GDB_SystemCatalog",) + names)
+        listed = catalog("Parcels", "Roads_old")
+        check(dataset_in_catalog(listed, "Parcels") is True
+              and dataset_in_catalog(listed, "parcels") is True
+              and dataset_in_catalog(listed, "GIS.Parcels") is True
+              and dataset_in_catalog(listed, "Roads") is False
+              and dataset_in_catalog(listed, "Gone") is False,
+              "the catalog answers on whole names, without case, "
+              "so Roads is not found inside Roads_old  <-- pinned defect")
+        wide = b"".join(bytes([2 * len(n)]) + n.encode("utf-16-le") + b"\0\0"
+                        for n in ("GDB_SystemCatalog", "Parcels"))
+        check(dataset_in_catalog(wide, "Parcels") is True
+              and dataset_in_catalog(wide, "Roads") is False
+              and dataset_in_catalog(wide, "x" * 64) is False,
+              "a catalog that stores its names as UTF-16 is read too")
+        longname = "n" * 130
+        check(dataset_in_catalog(catalog(longname), longname) is True
+              and dataset_in_catalog(catalog("m" * 130), longname) is False,
+              "a name over 127 bytes carries a two-byte length")
+        check(dataset_in_catalog(None, "Parcels") is None
+              and dataset_in_catalog(listed, "") is None
+              and dataset_in_catalog(listed, "x" * 128) is False
+              and dataset_in_catalog(listed, "Parc\u00e9s") is None
+              and dataset_in_catalog(b"\0" * 40, "Parcels") is None,
+              "no catalog, no name, a name it cannot match and a table that "
+              "does not list itself all answer unknown")
+        gdbs = os.path.join(workdir, "gdbs")
+        for name, table in (("ok.gdb", listed), ("junk.gdb", b"\0" * 40)):
+            os.makedirs(os.path.join(gdbs, name))
+            with open(os.path.join(gdbs, name, "a00000001.gdbtable"),
+                      "wb") as handle:
+                handle.write(table)
+        os.makedirs(os.path.join(gdbs, "empty.gdb"))
+        with open(os.path.join(gdbs, "file.gdb"), "w") as handle:
+            handle.write("not a folder")
+        gdb_path = os.path.join(gdbs, "Gdb.lyrx")
+        with open(gdb_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("Here", _fixture_std("DATABASE=ok.gdb", "Parcels")),
+                ("Dropped", _fixture_std("DATABASE=ok.gdb", "Gone")),
+                ("Junk", _fixture_std("DATABASE=junk.gdb", "Parcels")),
+                ("Empty", _fixture_std("DATABASE=empty.gdb", "Parcels")),
+                ("AFile", _fixture_std("DATABASE=file.gdb", "Parcels")),
+                ("Folder", _fixture_std("DATABASE=ok.gdb", "")),
+                ("Shapes", _fixture_std("DATABASE=.", "Parcels"))]))
+        check([s.state for s in scan_document(gdb_path).sources]
+              == [PRESENT, MISSING, UNKNOWN, UNKNOWN, UNKNOWN, PRESENT,
+                  PRESENT],
+              "a dropped feature class in a geodatabase that is there is "
+              "MISSING, one the catalog cannot answer for is unknown  "
+              "<-- pinned defect")
+        gdb_rows = group_by_workspace(scan_document(gdb_path).sources)
+        check(sorted((g["state"], g["count"]) for g in gdb_rows
+                     if g["workspace"] == "DATABASE=ok.gdb")
+              == [(MISSING, 1), (PRESENT, 2)],
+              "datasets of one geodatabase with two verdicts are two plan "
+              "rows  <-- pinned defect")
+        check(read_catalog(os.path.join(gdbs, "ok.gdb")) == listed
+              and read_catalog(os.path.join(gdbs, "empty.gdb")) is None,
+              "the catalog is the first table of the folder")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

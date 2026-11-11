@@ -13,7 +13,7 @@ used to point at.
 Esri's own answer is `arcpy.mp.ArcGISProject.listBrokenDataSources()`, which "Returns a Python list
 of Layer and/or Table objects that have broken connections to their original source data for all
 maps in a project"
-([Esri documentation](https://pro.arcgis.com/en/pro-app/latest/arcpy/mapping/arcgisproject-class.htm)).
+([Esri documentation](https://doc.esri.com/en/arcgis-pro/latest/arcpy/mapping/arcgisproject-class.html)).
 It understands every layer type Pro understands and follows the format as it changes. It needs
 arcpy and a licence on the machine that runs it. `cimscan` reads the project files directly, so it
 runs where the projects live, and it lists every source and not only the broken ones. See
@@ -55,7 +55,7 @@ PASS  a drive letter the session does not have is unknown, not MISSING  <-- pinn
 ...
 PASS  --json on a folder with no documents is still JSON  <-- pinned defect
 ...
-PASS  the footer counts every source and only the MISSING ones  <-- pinned defect
+PASS  the footer counts every source, the MISSING ones and the unknown ones  <-- pinned defect
 ...
 PASS  a layer the layers array does not list is still reported  <-- pinned defect
 ...
@@ -79,8 +79,17 @@ PASS  the full flag names still parse
 PASS  a feature dataset left on the old database is two findings  <-- pinned defect
 PASS  a repointed connection over a dataset still named for the old database is a finding  <-- pinned defect
 ...
+PASS  a feature dataset layer with an unqualified name could not be compared  <-- pinned defect
+PASS  the text report counts the layers it could not compare, and exits 0  <-- pinned defect
+...
+PASS  the footer and --json count the unknown sources, which exit 0  <-- pinned defect
+PASS  a stat refused for any reason but absence is unknown, not MISSING  <-- pinned defect
+...
+PASS  a dropped feature class in a geodatabase that is there is MISSING, one the catalog cannot answer for is unknown  <-- pinned defect
+PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
+...
 --------------------------------------------------------------------
-315 assertions, 0 failed
+329 assertions, 0 failed
 ```
 
 ## Requirements
@@ -132,21 +141,23 @@ The parser refuses abbreviated flags (`allow_abbrev=False`). `--ap` is an error 
 so the one flag that authorises an outbound action cannot be typed by accident. The parser exits 64
 on that error and on every other bad command line.
 
-The UNC check was run for real once, by hand, on Windows against the administrative share of the
-machine itself, and not in the self-test, because a share is specific to a host. The tool has no
-HTTP path, so there is no `http.server` stub to point it at:
+The UNC check was run for real by hand on Windows against the administrative share of the machine
+itself, and not in the self-test, because a share is specific to a host. The tool has no HTTP code
+and opens no socket, so there is no `http.server` stub to point it at. The round trip is Windows
+answering a stat, and a local stub cannot stand in for that. The self-test pins the decision
+(`--check-network` turns the stat on, a UNC path is otherwise `unknown`) with an injected stat:
 
 ```
 $ python cimscan.py Loop.lyrx --check-network
 == Loop.lyrx  [OK]
-   present  (no map) > Here                    x                        \\localhost\C$\Windows
-   MISSING  (no map) > Gone                    x                        \\localhost\C$\no-such-folder-cimscan
+   present  (no map) > Here                    x                        DATABASE=\\localhost\C$\Windows
+   MISSING  (no map) > Gone                    x                        DATABASE=\\localhost\C$\no-such-folder-cimscan
 
 workspaces: 2 source(s) across 2 workspace(s)
-      1  present  \\localhost\C$\Windows
-      1  MISSING  \\localhost\C$\no-such-folder-cimscan
+      1  present  DATABASE=\\localhost\C$\Windows  -> \\localhost\C$\Windows
+      1  MISSING  DATABASE=\\localhost\C$\no-such-folder-cimscan  -> \\localhost\C$\no-such-folder-cimscan
 
-1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 1 missing, 0 unreadable directory(s)
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 1 missing, 0 unknown, 0 unreadable directory(s)
 ```
 
 Without the flag the same two rows read `unknown`.
@@ -159,7 +170,9 @@ For every layer and standalone table in every document:
 - The connection type, for example `CIMStandardDataConnection` or `CIMSqlQueryDataConnection`.
 - The workspace connection string, with every secret redacted.
 - The dataset it asks for, or the query name when a query layer has no dataset.
-- Whether the resolved path is on disk right now: `present`, `MISSING`, or `unknown`.
+- Whether the resolved path is on disk right now: `present`, `MISSING`, or `unknown`. For a file
+  geodatabase, whether it still lists the dataset too. See
+  [A geodatabase that lost a feature class](#a-geodatabase-that-lost-a-feature-class).
 - A `split workspace` finding when the names of one layer disagree about where its data lives. See
   [Split workspaces](#split-workspaces).
 
@@ -171,6 +184,14 @@ server has no `C:` drive. A drive letter the running Windows session does not ha
 for the same reason. A scheduled task does not see the drives a user mapped, and its `X:` root does
 not exist, so every layer on it would otherwise read as gone. The same document gives the same verdict on every host that can answer,
 and `unknown` on every host that cannot.
+
+`unknown` is neither clean nor gone: the tool could not tell. The footer counts it beside `missing`,
+and `--json` carries `missing_sources` and `unknown_sources`. A scan whose sources are all `unknown`
+still exits 0, like a scan full of `MISSING`, so a job that needs a verdict reads the footer and
+not the exit code. A path that cannot be statted for any reason except absence is `unknown` as
+well. `os.path.exists` answers False for every stat failure, so a folder behind a parent the
+scanning account may not read used to print `MISSING`. Run as a non-root user on Linux, a
+`DATABASE=blocked/inner.gdb` under a folder of mode 000 now prints `unknown`.
 
 Sources are then grouped by workspace, because four layers on one `.sde` are one decommissioning
 decision and not four. The fixture project the self-test builds is a zip of CIM XML parts. A
@@ -189,7 +210,7 @@ workspaces: 7 source(s) across 2 workspace(s)
       2  MISSING  DATABASE=..\commondata\parcels.gdb  -> ...\commondata\parcels.gdb
       5  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***;AUTHENTICATION_MODE=DBMS
 
-1 document(s), 1 OK, 0 UNSUPPORTED, 7 source(s), 2 missing, 0 unreadable directory(s)
+1 document(s), 1 OK, 0 UNSUPPORTED, 7 source(s), 2 missing, 5 unknown, 0 unreadable directory(s)
 ```
 
 A `.mapx` and a `.pagx` are reported the same way. These are self-test fixtures built from the CIM
@@ -226,6 +247,41 @@ workspaces: 1 source(s) across 1 workspace(s)
 A plan row names the resolved path as well as the workspace string. Two projects both saying
 `DATABASE=..\commondata\parcels.gdb` mean two different folders, so they stay two rows. Keying the
 row on the text alone let a geodatabase that was gone hide behind a row reading `present`.
+
+## A geodatabase that lost a feature class
+
+A folder check cannot see a dropped feature class. The `.gdb` folder is still there, so the layer
+read `present` and the report said everything was fine. A file geodatabase that is there is now
+asked one more question: does it still list the dataset? `cimscan` reads the first table of the
+folder, `a00000001.gdbtable`, which the open file geodatabase format description calls
+`GDB_SystemCatalog` and describes as "a list of tables (including itself, other reserved tables
+and user tables)" ([FGDB-Spec](https://github.com/rouault/dump_gdbtable/wiki/FGDB-Spec)). It
+looks for the dataset name there as a length byte and the characters. A name that is not listed
+reads `MISSING`:
+
+```
+$ python cimscan.py Dropped.lyrx
+== Dropped.lyrx  [OK]
+   present  (no map) > Parcels                 Parcels                  DATABASE=parcels.gdb
+   MISSING  (no map) > Roads                   Roads                    DATABASE=parcels.gdb
+
+workspaces: 2 source(s) across 1 workspace(s)
+      1  MISSING  DATABASE=parcels.gdb  -> ...\parcels.gdb
+      1  present  DATABASE=parcels.gdb  -> ...\parcels.gdb
+
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 1 missing, 0 unknown, 0 unreadable directory(s)
+```
+
+The two layers share a workspace string and have two verdicts, so they are two plan rows. The
+catalog check answers `unknown`, not `MISSING`, whenever it cannot be sure: the folder holds no
+catalog, the catalog does not list itself, or the name is not ASCII. The format description marks
+the string encoding as uncertain ("UTF-8 ?") and says a header flag selects UTF-8 or UTF-16, so
+both are tried. I checked the layout on a geodatabase written by GDAL's OpenFileGDB driver, where
+`Parcels` and `Roads` were found and a name that was never created was not. I had no geodatabase
+written by ArcGIS Pro to test against. The self-test builds its catalogs from synthetic bytes
+that follow the description. The description also says the catalog "might" hold deleted rows, so a
+feature class dropped a moment ago can still read `present`. The check never reads `MISSING` for
+a name that the catalog lists.
 
 ## What it refuses
 
@@ -267,7 +323,7 @@ and drive the exit code to 1:
 
 ```
 !! cannot list projects\archive: Access is denied
-1 document(s), 0 OK, 1 UNSUPPORTED, 0 source(s), 0 missing, 1 unreadable directory(s)
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 2 unknown, 1 unreadable directory(s)
 ```
 
 `--json` carries the same list under `unreadable_directories`, so the two output modes cannot
@@ -321,7 +377,7 @@ What the Esri documentation says, and what the check rests on:
   cannot be a second connection string.
 - In an enterprise geodatabase, the `dataset` of a layer is a qualified name. Esri's sample reads
   `'dataset': 'TestDB.USER.RangerStations'` beside `'database': 'TestDB'`
-  ([Updating and fixing data sources](https://pro.arcgis.com/en/pro-app/latest/arcpy/mapping/updatingandfixingdatasources.htm)).
+  ([Updating and fixing data sources](https://doc.esri.com/en/arcgis-pro/latest/arcpy/mapping/updatingandfixingdatasources.html)).
 - The same page says that `updateConnectionProperties` "will automatically handle feature
   datasets", and its CIM examples set `dc.featureDataset` by hand when a script edits the CIM.
   A script that edits the CIM is the script that can leave one name behind.
@@ -342,19 +398,40 @@ workspaces: 2 source(s) across 1 workspace(s)
 
 split workspaces: 2 finding(s). The names of a layer disagree about where its data lives.
 
-1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 0 unreadable directory(s)
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 2 unknown, 0 unreadable directory(s)
 ```
 
 1. The `dataset` and the `featureDataset` are both qualified, and the parts they both carry differ.
    Names are compared from the right, so `GIS.Water` and `warehouse1.GIS.Hydrants` agree on the
-   owner and are not a finding. A feature class cannot sit in a feature dataset of another owner.
+   owner and are not a finding. Two different owners are reported as a split. I found no Esri page
+   that states this rule, so it is this tool's judgement and not a documented fact.
 2. On a SQL Server connection (`DBCLIENT=sqlserver`, or an `INSTANCE` starting `sde:sqlserver`), a
    name with a database part names a database other than the `DATABASE` property. This is the
    case where the repoint changed the connection and left the names.
 
-Both are quiet when they cannot tell. A name with no `.` proves nothing. A file or folder workspace
-is never checked, because a shapefile or CAD name holds a `.` for another reason. A string that
-does not look like an enterprise connection is skipped.
+Neither finding can be made from an unqualified name, because a name with no `.` names no owner and
+no database. A clean split result therefore proves nothing for such a layer, and the report says
+so instead of staying silent. A layer on a remote workspace whose `dataset` or `featureDataset`
+is unqualified is counted on a `split check:` line, and `--json` carries `splitUnchecked` on the
+source and `split_unchecked_sources` in total:
+
+```
+$ python cimscan.py Unq.lyrx
+== Unq.lyrx  [OK]
+   unknown  (no map) > Hydrants                Hydrants                 SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+   unknown  (no map) > Mains                   warehouse1.GIS.Mains     SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+
+workspaces: 2 source(s) across 1 workspace(s)
+      2  unknown  SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1;DBCLIENT=sqlserver;DATABASE=warehouse1;USER=viewer;PASSWORD=***REDACTED***
+
+split check: 1 feature dataset layer(s) had unqualified names and could not be compared, which is not the same as clean.
+
+1 document(s), 1 OK, 0 UNSUPPORTED, 2 source(s), 0 missing, 2 unknown, 0 unreadable directory(s)
+```
+
+A file or folder workspace is never checked and never counted, because a shapefile or CAD name
+holds a `.` for another reason. A string that does not look like an enterprise connection is
+skipped. A layer with a `dataset` and no `featureDataset` is not a feature dataset layer.
 
 A finding is a finding and not a failure: it does not change the exit code, like `MISSING`. The
 self-test builds each case from synthetic JSON and XML connections. Five hand-made mutations of
@@ -363,8 +440,8 @@ and the enterprise-connection gate) each failed at least one assertion.
 
 **Save and reopen.** The source of this idea said the broken flag Pro shows is reliable only after a
 save and a reopen. I found no sentence saying that in the Esri pages I read (the Layer class, the
-ArcGISProject class and Updating and fixing data sources), so `cimscan` does not rely on it and
-this README does not state it as fact. What is certain is narrower. `cimscan` reads the bytes on
+ArcGISProject class and Updating and fixing data sources, the last re-read on its current
+doc.esri.com address), so `cimscan` does not rely on it and this README does not state it as fact. What is certain is narrower. `cimscan` reads the bytes on
 disk, so it sees a project only as it was last saved. Each repoint example on the update page ends
 with `saveACopy` or `save`, and a repoint that was never saved is not in the file this tool reads.
 Scan after the save, not after the script.
@@ -373,8 +450,8 @@ Scan after the save, not after the script.
 
 An `.sde` is not a CIM document. The Create Database Connection tool summary reads "Creates a file
 that ArcGIS uses to connect to a database, a cloud data warehouse, or an enterprise geodatabase".
-Its `out_name` parameter says "The output file will have the .sde extension", and its output is a
-"database connection file (.sde or .dbconn)"
+Its `out_name` parameter says "The output file will have the .sde extension", and its output is
+"The output database connection file ( .sde or .dbconn )"
 ([Esri documentation](https://pro.arcgis.com/en/pro-app/3.5/tool-reference/data-management/create-database-connection.htm)).
 Before this note existed, an `.sde` handed to `cimscan` went to the XML parser and came back as
 `part Prod.sde did not parse: not well-formed (invalid token)`. That was true, and it told the
@@ -389,7 +466,7 @@ $ python cimscan.py Prod.sde
 
 workspaces: 0 source(s) across 0 workspace(s)
 
-1 document(s), 0 OK, 1 UNSUPPORTED, 0 source(s), 0 missing, 0 unreadable directory(s)
+1 document(s), 0 OK, 1 UNSUPPORTED, 0 source(s), 0 missing, 0 unknown, 0 unreadable directory(s)
 ```
 
 The status, the count and the exit code are the ones the old message had: `UNSUPPORTED`, and exit 1.
@@ -528,9 +605,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
   with consistent names, is not reported.
 - The split check assumes `featureDataset` is written as a qualified name when `dataset` is. The
   specification says only "Feature dataset" and types it as a string, and no saved file with a
-  feature dataset was available here, so the case where it is written unqualified is quiet and a
-  split in it is missed. The database comparison runs on SQL Server connections only. An Oracle or
-  PostgreSQL connection gets the owner comparison between the two names and nothing else.
+  feature dataset was available here. When either name is unqualified the layer is counted on the
+  `split check:` line and not compared, so a split in it is missed. A repoint that rewrites only
+  the database part of a name and leaves an unqualified `featureDataset` behind is not reported.
+- The database comparison runs on SQL Server connections only. An Oracle or PostgreSQL connection
+  gets the owner comparison between the two names and nothing else. When only the owner differs
+  inside one database, for example `warehouse1.GIS.Hydrants` against `warehouse1.DBO.Water`, the
+  line still reads "name different workspaces", which is loose wording for an owner difference.
 - Only the first connection object of a layer is read, plus the tables nested inside it when it is a
   join. A relate to another table is not followed. A layer with no connection anywhere under it is
   skipped without a note. A layer nested more than 64 levels deep is dropped without a note.
@@ -546,10 +627,26 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - A drive-relative workspace such as `C:parcels.gdb` is checked against the current directory on
   that drive of the scanning host, so the verdict depends on where the scan runs.
 - A secret key name with a tab or other whitespace before the `=`, an unencoded `/` or `;` in a URL
-  password, and a secret under a name that is not on the denylist, such as `AUTH` or `COOKIE`, print
-  as stored.
-- A UNC name in the `\\host@SSL\share` WebDAV form makes `--check-network` and `--apply` send an
-  HTTPS request. A reserved Windows device name such as `CON` in a relative workspace is statted
+  password, and a secret under a name that is not on the denylist, such as `AUTH`, `COOKIE` or a
+  `code=` query parameter, print as stored. A `#` inside a token value ends the redacted value, so
+  the text after it prints. A password that follows a line break in the connection string and holds
+  `&` or `?` is redacted only up to that character.
+- The text report prints layer names, workspaces and notes as stored, so a hostile document can
+  forge report lines or send terminal escape codes. Use `--json`, which escapes them, or scan
+  trusted files.
+- A layer reference that names a part the document does not contain, as in a damaged project, is
+  skipped without a note, so such a project can report `OK`.
+- Several behaviours here have no vendor citation: that a scheduled task does not see a user's
+  mapped drives, that a stat on a UNC path contacts the host, and the owner rule of a qualified
+  feature dataset name. They come from running the tool, not from a Microsoft or Esri page. The
+  `os.walk` `onerror` behaviour is documented by Python.
+- An unqualified `PASSWORD=ab;c=SECRETPART` redacts `ab` and keeps `c=SECRETPART`, because a chunk
+  with an `=` reads as a property of its own. This is the leak the `;` rule cannot close without
+  hiding real properties.
+- A UNC name in the `\\host@SSL\share` WebDAV form can make Windows contact that host over HTTPS
+  when `--check-network` or `--apply` is given, if the WebClient service is running. The tool itself
+  opens no socket. I could not confirm this here, because the service is stopped on the test host
+  and a local `http.server` stub received no request. A reserved Windows device name such as `CON` in a relative workspace is statted
   without any flag and can read as present or block. Scan only documents you trust.
 - An XML document with an undefined entity puts the entity name from the file into the
   `UNSUPPORTED` note.
@@ -566,9 +663,14 @@ Two format facts cost more time than anything else here, and both are pinned by 
   `--check-network` is passed, because the resolved path is itself a UNC path.
 - On a case-sensitive Linux filesystem, a workspace path whose case differs from the folder on disk
   is reported `MISSING` although Windows would find it. A Windows-rooted path with no drive, such as
-  `\data\x.gdb`, is statted as `/data/x.gdb` on Linux, so that verdict differs by host.
+  `\data\x.gdb`, is statted as `/data/x.gdb` on Linux, so that verdict differs by host. On
+  Windows it is statted against the current drive on Python 3.12 and earlier, and against the
+  document's drive on 3.13, because `os.path.isabs` changed in 3.13.
 - For a folder-based workspace such as a shapefile or CSV folder, only the folder is checked. A
-  deleted dataset file inside an existing folder is reported `present`.
+  deleted dataset file inside an existing folder is reported `present`. Only a `.gdb` folder is
+  asked about its dataset. A catalog row dropped a moment ago can still read `present`, a name that
+  is not ASCII reads `unknown`, and I tested the catalog layout on one GDAL-written geodatabase and
+  not on one written by ArcGIS Pro.
 - A service layer keeps its URL in a nested `serverConnection`, so its row shows `(no dataset)`:
   `objectName` is not read from the outer connection.
 - A filtered scan hides an `[OK]` document that matched nothing. A `--filter` match also reads the
@@ -592,12 +694,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
   connection-type fields print as stored, so a dataset that is itself a URL with a token would show
   the token.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.15 and 3.13.2
-  on Windows and on 3.12.3 on Linux, each at 315 assertions, under `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1324 statements and 306
+  on Windows (and 3.12 on Windows) and on 3.12.3 on Linux, each at 329 assertions, under
+  `-W error`. 3.11 was not run for this count.
+- Branch coverage is 100 percent only with the two hosts combined: 1421 statements and 328
   branches, measured with `coverage combine` over one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1204-1205) and Linux
-  never runs the `icacls` ones (1196-1203). Both hosts print the same assertion count, 315. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1309-1310) and Linux
+  never runs the `icacls` ones (1301-1308). Both hosts print the same assertion count, 329. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
