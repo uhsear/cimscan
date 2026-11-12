@@ -68,12 +68,15 @@ REDACTION = "***REDACTED***"
 # substring rather than on a list of names Esri is free to add to. PASS covers
 # PASSWORD, PASSWD and PASSPHRASE, and KEY covers every API, account and access
 # key spelling. SIG is a signed-URL signature (sig=, SIGNATURE). TOKEN, SECRET,
-# SESSION, AUTHORIZATION and BEARER are here because a portal or feature
-# service connection stores its credential under one of those names, and a
+# SESSION, AUTH (auth=, AUTHORIZATION), BEARER, COOKIE and CRED (CREDENTIAL,
+# creds=) are here because a portal or feature service connection stores its
+# credential under one of those names, and a
 # token in a ticket is as usable as a password until it expires. The match errs
-# toward hiding: a harmless key such as KEYFILE loses its value too.
-SECRET_KEY_MARKERS = ("PASS", "PW", "TOKEN", "SECRET", "KEY", "CREDENTIAL",
-                      "SIG", "SESSION", "AUTHORIZATION", "BEARER")
+# toward hiding: a harmless key such as KEYFILE loses its value too. The one
+# exception is the word AUTHENTICATION: AUTHENTICATION_MODE=DBMS is an .sde
+# property that names how to sign in and holds no secret.
+SECRET_KEY_MARKERS = ("PASS", "PW", "TOKEN", "SECRET", "KEY", "CRED",
+                      "SIG", "SESSION", "AUTH", "BEARER", "COOKIE")
 
 # The part name given to a document that holds its layer at the root instead of
 # in a definitions array. Any name that no CIMPATH can spell would do; this one
@@ -294,6 +297,12 @@ def _split_properties(text):
     return chunks
 
 
+def _secret_name(key):
+    """True when a key name holds a secret marker."""
+    return any(m in key.upper().replace("AUTHENTICATION", "")
+               for m in SECRET_KEY_MARKERS)
+
+
 def redact(text):
     """Replace every secret-bearing value in a connection string.
 
@@ -319,8 +328,7 @@ def redact(text):
     swallowing = False
     for chunk in _split_properties(text):
         key, sep, _value = chunk.partition("=")
-        if sep and _PLAIN_KEY.match(key) and any(
-                m in key.upper() for m in SECRET_KEY_MARKERS):
+        if sep and _PLAIN_KEY.match(key) and _secret_name(key):
             out.append("%s=%s" % (key, REDACTION))
             swallowing = True
         elif swallowing and chunk.strip() and (
@@ -331,7 +339,9 @@ def redact(text):
             chunk = _USERINFO.sub(lambda m: m.group(1) + ":" + REDACTION + "@",
                                   chunk)
             out.append(_SECRET_PAIR.sub(
-                lambda m: m.group(1) + "=" + REDACTION, chunk))
+                lambda m: (m.group(1) + "=" + REDACTION
+                           if _secret_name(m.group(1)) else m.group(0)),
+                chunk))
     return ";".join(out)
 
 
@@ -370,13 +380,37 @@ REMOTE_MARKERS = frozenset(
     ("SERVER", "INSTANCE", "DBCLIENT", "DB_CONNECTION_PROPERTIES"))
 
 
+def _connection_file(value):
+    """True when a path names a database connection file, an .sde.
+
+    The file only holds the address of a database. The database itself is not
+    on the disk the file sits on, so the file being there proves nothing about
+    the data, and the names that go with it are qualified like a server's.
+    """
+    return (value or "").strip().lower().endswith(".sde")
+
+
+def _enterprise_props(workspace):
+    """The properties of a workspace string that names an enterprise database."""
+    props = parse_properties(workspace) if isinstance(workspace, str) else {}
+    if REMOTE_MARKERS.intersection(props):
+        return props
+    if _connection_file(props.get("DATABASE")) or (
+            isinstance(workspace, str) and "=" not in workspace
+            and _connection_file(workspace)):
+        return props
+    return None
+
+
 def workspace_path(workspace):
     """The filesystem path a workspace string points at, or None.
 
     A remote geodatabase carries a DATABASE property too, and there it is the
     name of a database on a server rather than a path. Treating it as a path
     reports every SDE layer on the server as MISSING, and the report becomes
-    noise that nobody reads.
+    noise that nobody reads. A path that names an .sde connection file is not
+    a path either. Finding the file says nothing about the database it points
+    at, so the layer reads unknown, as one that spells out SERVER does.
     """
     workspace = (workspace or "").strip()
     if not workspace:
@@ -386,13 +420,14 @@ def workspace_path(workspace):
     if _SCHEME.match(workspace):
         return None
     if "=" not in workspace:
-        return workspace
+        return None if _connection_file(workspace) else workspace
     props = parse_properties(workspace)
     if REMOTE_MARKERS.intersection(props):
         return None
     database = props.get("DATABASE") or None
     # The same rule for a URL held in the DATABASE property.
-    if database and _SCHEME.match(database.strip()):
+    if database and (_SCHEME.match(database.strip())
+                     or _connection_file(database)):
         return None
     return database
 
@@ -421,13 +456,15 @@ def split_findings(connection):
 
     A name with no "." is unqualified and proves nothing, so nothing is said
     about it. A file or folder workspace is never checked: its names are not
-    qualified, and a shapefile or CAD name holds a "." for another reason.
+    qualified, and a shapefile or CAD name holds a "." for another reason. A
+    workspace that is an .sde connection file counts as enterprise, with or
+    without a SERVER property: the name-to-name comparison needs no database
+    property. Only the database comparison needs one, and the file has none.
     """
     if not isinstance(connection, dict):
         return []
-    workspace = connection.get("workspaceconnectionstring")
-    props = parse_properties(workspace) if isinstance(workspace, str) else {}
-    if not REMOTE_MARKERS.intersection(props):
+    props = _enterprise_props(connection.get("workspaceconnectionstring"))
+    if props is None:
         return []
     names = []
     for label, key in (("dataset", "dataset"),
@@ -467,9 +504,7 @@ def split_unchecked(connection):
     """
     if not isinstance(connection, dict):
         return False
-    workspace = connection.get("workspaceconnectionstring")
-    props = parse_properties(workspace) if isinstance(workspace, str) else {}
-    if not REMOTE_MARKERS.intersection(props):
+    if _enterprise_props(connection.get("workspaceconnectionstring")) is None:
         return False
     names = [connection.get(key) for key in ("dataset", "featuredataset")]
     if not all(isinstance(n, str) and n.strip() for n in names):
@@ -2922,6 +2957,16 @@ def self_test():
               == "URL=https://u:%s@h/x" % REDACTION,
               "a URL password holding an at sign is redacted whole"
               "  <-- pinned defect")
+        auth_urls = [redact(u) for u in (
+            "URL=https://h/x/FeatureServer?auth=abc123&f=json",
+            "https://host/x?cookie=sess123", "https://host/x?creds=cred123",
+            "https://host/x?authentication=OS&f=json")]
+        check(all(x not in "".join(auth_urls[:3])
+                  for x in ("abc123", "sess123", "cred123"))
+              and auth_urls[0].endswith("&f=json")
+              and auth_urls[3] == "https://host/x?authentication=OS&f=json",
+              "auth, cookie and creds query values are redacted, the word "
+              "authentication is not a marker  <-- pinned defect")
         check(redact("PASSWORD=a;b;USER=u;c")
               == "PASSWORD=%s;USER=u;c" % REDACTION,
               "a chunk after an ordinary property is kept, not swallowed")
@@ -3061,6 +3106,44 @@ def self_test():
                               "dataset": ["a", "b"],
                               "featuredataset": 7}) == [],
               "a dataset or feature dataset that is no string says nothing")
+
+        # ---- a workspace that is an .sde connection file
+        sde_file = "DATABASE=%s" % os.path.join(workdir, "conns", "gone.sde")
+        check(workspace_path(sde_file) is None
+              and workspace_path(os.path.join(workdir, "conns", "A.SDE"))
+              is None
+              and workspace_path("DATABASE=C:\\gis\\parcels.gdb")
+              == "C:\\gis\\parcels.gdb",
+              "an .sde connection file is not a path whose presence says "
+              "anything about the database  <-- pinned defect")
+        check(findings(sde_file, "new.GIS.Roads", "old.GIS.Transport")
+              == ["dataset new.GIS.Roads and feature dataset "
+                  "old.GIS.Transport name different workspaces"]
+              and findings(sde_file, "old.GIS.Roads", "old.GIS.Transport")
+              == []
+              and findings(os.path.join(workdir, "a.sde"), "new.GIS.Roads",
+                           "old.GIS.Transport") != [],
+              "an .sde workspace with no SERVER property still has its two "
+              "names compared  <-- pinned defect")
+        check(split_unchecked(_lower_keys(_fixture_fd(
+                  sde_file, "Roads", "old.GIS.Transport")))
+              and not split_unchecked(_lower_keys(_fixture_fd(
+                  "DATABASE=" + workdir, "Roads", "old.GIS.Transport"))),
+              "an .sde layer whose names cannot be compared is counted")
+        sde_layers = _fixture_layers_lyrx([
+            ("Roads", _fixture_fd(sde_file, "new.GIS.Roads",
+                                  "old.GIS.Transport"))])
+        sde_lyrx = os.path.join(workdir, "SdeFile.lyrx")
+        with open(sde_lyrx, "w") as handle:
+            handle.write(sde_layers)
+        code, out = run([sde_lyrx])
+        sde_source = scan_document(sde_lyrx).sources[0]
+        check(code == 3 and sde_source.present is None
+              and len(sde_source.split) == 1
+              and out.count("! split workspace:") == 1,
+              "a layer on an .sde file reads unknown, never present, and its "
+              "split is reported, so the scan is not a clean exit 0  "
+              "<-- pinned defect")
 
         split_layers = _fixture_layers_lyrx([
             ("Hydrants", _fixture_fd(FIXTURE_SQL, "warehouse1.GIS.Hydrants",
@@ -3408,7 +3491,8 @@ def _parse(argv):
                         help="folder to walk, or a single document")
     parser.add_argument("--filter", default=None,
                         help="report only sources whose workspace, path, "
-                             "dataset or layer name contains this text")
+                             "dataset, layer, map or connection type contains "
+                             "this text, or whose split finding does")
     parser.add_argument("--json", action="store_true",
                         help="emit the scan as JSON instead of the text report")
     parser.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"),

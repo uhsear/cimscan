@@ -31,6 +31,8 @@ PASS  a token in a service URL query string is redacted too  <-- pinned defect
 PASS  dbclient with no SERVER or INSTANCE is still a remote database  <-- pinned defect
 PASS  db_connection_properties with no SERVER or INSTANCE is still a remote database  <-- pinned defect
 ...
+PASS  a layer whose only change is its feature dataset is reported  <-- pinned defect
+...
 PASS  a password holding an ampersand is redacted whole  <-- pinned defect
 PASS  a password holding a semicolon loses its tail too  <-- pinned defect
 PASS  a quoted password holding a semicolon is one value  <-- pinned defect
@@ -45,8 +47,6 @@ PASS  --filter finds the server hidden behind a join  <-- pinned defect
 ...
 PASS  --diff sees a repoint of the joined table  <-- pinned defect
 PASS  repointing the first of two same-named layers is reported  <-- pinned defect
-...
-PASS  a layer whose only change is its feature dataset is reported  <-- pinned defect
 ...
 PASS  --diff of two JSON files that are not CIM exits 1  <-- pinned defect
 ...
@@ -74,6 +74,7 @@ PASS  so a service URL named by DATABASE reads unknown, not MISSING  <-- pinned 
 PASS  pw, pass, sig, key, session and authorization values are redacted  <-- pinned defect
 ...
 PASS  a URL password holding an at sign is redacted whole  <-- pinned defect
+PASS  auth, cookie and creds query values are redacted, the word authentication is not a marker  <-- pinned defect
 ...
 PASS  every parser error exits 64  <-- pinned defect
 ...
@@ -86,11 +87,18 @@ PASS  the full flag names still parse
 PASS  a feature dataset left on the old database is two findings  <-- pinned defect
 PASS  a repointed connection over a dataset still named for the old database is a finding  <-- pinned defect
 ...
+PASS  an .sde connection file is not a path whose presence says anything about the database  <-- pinned defect
+PASS  an .sde workspace with no SERVER property still has its two names compared  <-- pinned defect
+...
+PASS  a layer on an .sde file reads unknown, never present, and its split is reported, so the scan is not a clean exit 0  <-- pinned defect
+...
 PASS  a feature dataset layer with an unqualified name could not be compared  <-- pinned defect
+...
 PASS  the text report counts the layers it could not compare, and exits 3 because its sources are unknown  <-- pinned defect
 ...
 PASS  the footer and --json count the unknown sources, and a scan that could not tell exits 3 with no flag  <-- pinned defect
 PASS  --strict turns unknown sources into exit 3  <-- pinned defect
+...
 PASS  a stat refused for any reason but absence is unknown, not MISSING  <-- pinned defect
 PASS  a UNC host that does not answer (winerror 53) is unknown, a share the host lacks (winerror 67) is MISSING  <-- pinned defect
 ...
@@ -98,7 +106,7 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-356 assertions, 0 failed
+361 assertions, 0 failed
 ```
 
 ## Requirements
@@ -190,6 +198,8 @@ For every layer and standalone table in every document:
 
 `unknown` is a third verdict on purpose. A feature service and a remote geodatabase have no local
 path to check, and calling them `MISSING` would bury the file geodatabases that really are gone.
+A database reached through an `.sde` connection file is `unknown` too: the file only holds an
+address, so finding it says nothing about the database, and the file is never opened.
 A Windows path (a drive letter or a UNC share) read on a Linux host is `unknown` too. The host
 cannot evaluate it, so a layer on `C:\gis\parcels.gdb` is not `MISSING` just because the file
 server has no `C:` drive. A drive letter the running Windows session does not have is `unknown`
@@ -360,9 +370,8 @@ nothing is claimed about them: the count says only how much of the tree the repo
 
 It also refuses to print a secret. An `.sde` connection string saved with a stored credential holds
 `PASSWORD=` or `ENCRYPTED_PASSWORD=` in clear text inside the document. Any property whose name
-contains `PASS`, `PW`, `TOKEN`, `SECRET`, `KEY`, `CREDENTIAL`, `SIG`, `SESSION`,
-`AUTHORIZATION` or `BEARER`
-loses its whole value before the record is built, so the text report, the `--json` output and the
+contains `PASS`, `PW`, `TOKEN`, `SECRET`, `KEY`, `CRED`, `SIG`, `SESSION`, `AUTH`, `BEARER`
+or `COOKIE` loses its whole value before the record is built, so the text report, the `--json` output and the
 `--diff` output are all covered by one guard instead of three. The rules are:
 
 - The string splits into properties on `;`, except inside a quoted value. A secret property loses
@@ -374,7 +383,9 @@ loses its whole value before the record is built, so the text report, the `--jso
   parameters and the key are kept.
 - A password in URL userinfo (`scheme://user:password@host`) is redacted and the user kept. The
   password runs to the last `@` before the path, so one that holds `@` goes whole.
-- The match is on a substring and errs toward hiding. A harmless `KEYFILE` loses its value too.
+- The match is on a substring and errs toward hiding. A harmless `KEYFILE` loses its value too. The
+  word `AUTHENTICATION` is the one exception, because `AUTHENTICATION_MODE=DBMS` is an `.sde`
+  property that holds no secret. `?auth=`, `?cookie=` and `?creds=` in a service URL are redacted.
 - The resolved `path` field gets the same treatment, so a secret in a `DATABASE=` URL does not
   reach it.
 - A URL of any scheme is never treated as a folder, so its userinfo cannot reach the `path` field.
@@ -463,8 +474,8 @@ split check: 1 feature dataset layer(s) had unqualified or unequally qualified n
 ```
 
 A file or folder workspace is never checked and never counted, because a shapefile or CAD name
-holds a `.` for another reason. A string that does not look like an enterprise connection is
-skipped. A layer with a `dataset` and no `featureDataset` is not a feature dataset layer.
+holds a `.` for another reason. A string that is neither a remote connection nor an `.sde` file
+is skipped. A layer with a `dataset` and no `featureDataset` is not a feature dataset layer.
 
 A finding is a finding and not a failure: it never changes the exit code, even under `--strict`.
 A layer in a remote workspace exits 3 with no flag, only because every remote source is `unknown`.
@@ -685,8 +696,8 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - Whether Pro marks a layer broken only after a save and reopen is not in Esri documentation, so
   cimscan does not rely on it. Scan after the save.
 - A secret key name with a tab or other whitespace before the `=`, an unencoded `/` or `;` in a URL
-  password, and a secret under a name that is not on the denylist, such as `AUTH`, `OAUTH`, `COOKIE` or a
-  `code=` query parameter, print as stored. A `#` inside a token value ends the redacted value, so
+  password, and a secret under a name that is not on the denylist, such as a `code=` query parameter or a
+  `SAS=` signature, print as stored. A `#` inside a token value ends the redacted value, so
   the text after it prints. A password that follows a line break in the connection string and holds
   `&` or `?` is redacted only up to that character.
 - The text report prints layer names, workspaces and notes as stored, so a hostile document can
@@ -714,13 +725,16 @@ Two format facts cost more time than anything else here, and both are pinned by 
   does not recognise.
 - A workspace string is a remote database, not a folder, when it carries `SERVER`, `INSTANCE`,
   `DBCLIENT` or `DB_CONNECTION_PROPERTIES`. A string with only a `DATABASE` property is still treated as a folder path and
-  reported `MISSING`, unless the value is a URL of any scheme, which reads `unknown`. A string that
-  points at an `.sde` file, with no `SERVER` or `INSTANCE` property, is read as a path, so a split
-  between its dataset and feature dataset is neither reported nor counted as unchecked. The
+  reported `MISSING`, unless the value is a URL of any scheme or names an `.sde` connection file,
+  which read `unknown`. A workspace that names an `.sde` file, with no `SERVER` or `INSTANCE`
+  property, is read as an enterprise connection. The file is never opened, so the layer reads
+  `unknown` and exits 3 whether or not the file is there, and its dataset and feature dataset names
+  are compared like a server's. The database comparison needs `DBCLIENT` or `INSTANCE`, which such
+  a string lacks, so only the name-to-name finding applies. The
   property names Pro writes for each database platform are not listed in Esri's documentation, so
   that list is read from saved files and could not be checked offline.
 - A drive letter mapped to a network share is treated as a local path and statted even without
-  `--check-network`, because only `\\` and `//` are recognised as network paths.
+  `--check-network`, because a drive letter does not look like a network path to this tool.
 - A scan whose root is a UNC share reports every relative workspace as `unknown` unless
   `--check-network` is passed, because the resolved path is itself a UNC path.
 - On a case-sensitive Linux filesystem, a workspace path whose case differs from the folder on disk
@@ -751,29 +765,44 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - Only `.aprx`, `.lyrx`, `.mapx` and `.pagx` are walked. A tree of ArcMap `.mxd` or `.lyr` files, or
   `.aptx` templates, prints `no ... documents under <dir>` and exits 0.
 - Piping a long report to a program that closes early, such as `head`, can raise `BrokenPipeError`
-  with a traceback and exit 1. A short report fits the pipe buffer and does not. An unexpected internal error exits 1 with a traceback, the same code as an
-  `UNSUPPORTED` document.
-- Redaction is a denylist of key-name fragments, the ten listed above. A secret stored under a name
+  with a traceback and exit 1. A short report fits the pipe buffer and does not.
+- An unexpected internal error exits 1 with a traceback, the same code as an `UNSUPPORTED`
+  document, so a tool crash and a finding about a document look alike.
+- Redaction is a denylist of key-name fragments, the eleven listed above. A secret stored under a name
   with none of them prints as stored. I found no list of the keys Esri writes into a workspace
   connection string, so the list cannot be checked against one. An `Authorization: Bearer ...`
   header written with a colon has no `=` and is not redacted. An unquoted password that holds both a
   `;` and an `=` leaks the part after the `=`, because that part reads as a property of its own.
 - Redaction does not cover `SAS=`, `jwt=` or `ticket=`, a percent-encoded `token%3D`, a token in a URL path segment, or a key
   holding a non-word character such as `DB$PASSWORD=ab&tail`, where the text after `&` prints.
-- On Windows with Python 3.12 or earlier, a workspace written as `\??\UNC\host\share` is statted
-  without `--check-network`, because only a leading `\` or `//` counts as a network path. A hostile
-  document can make the scanning host contact a share it names. Python 3.13 prepends the drive
-  instead, so it is not affected.
+- A workspace written in the NT namespace, as `\??\UNC\host\share`, counts as a network path on
+  every Python version, as do `\\?\UNC\host\share` and `\\host@SSL\share`. Each reads `unknown` and
+  is statted only with `--check-network` or `--apply`. The self-test pins the NT namespace
+  spelling with an injected stat that records no call.
 - `--apply` writes nothing. It only authorises the one outbound stat, so the name does not mean a
   destructive step, and no flag of this tool writes a file.
 - The mutation claim in "Split workspaces" (five hand-made mutations, each failed by an assertion)
   was a manual run. The four shipped files do not reproduce it.
+- A `featureDataset` that is not a JSON string is ignored: it gives no finding and no unchecked
+  count.
+- A `--filter` that matches no source exits 0 and prints `0 source(s)` in the footer, so a mistyped
+  server name gives a green run. Check the count.
+- A scan whose sources are all `MISSING` exits 0 unless you pass `--strict`.
+- The tool does not print the "scan after the save" advice at run time. It is in this README only.
+- A layer that holds its service URL directly on the layer, with no connection object, is not
+  seen. It is skipped silently, so `--filter` on its host finds nothing and exit 0 does not prove
+  the host is gone. `--diff` likewise reports no difference when only such a URL changed.
+- A drive letter that is mapped to a network share is statted without `--check-network`.
+- Redaction covers only the workspace and path fields. The dataset, layer, container, dangling
+  reference note, split finding text and definition query print as stored.
+- After a secret property, every unlisted property is redacted with it. This hides a real property
+  from `--filter` when its name is not on the connection-key list.
 - A layer with no `dataConnection` object that cimscan can find, such as a service URL held
   directly on the layer, is skipped with no note in a scan too. A document holding only such layers
   reports `OK` with `(no data sources read)` and exits 0.
 - A secret written in JSON form, such as `CONNECTION_PROPERTIES={"token":"..."}`, prints as stored,
-  because redaction matches only `NAME=value` pairs. This sits beside `AUTH`, `OAUTH`, `COOKIE` and
-  `code=` above.
+  because redaction matches only `NAME=value` pairs. This sits beside `code=`
+  above.
 - No Esri sentence says that the Pro broken flag is reliable only after a save and reopen, so this
   README does not state it. Scan after the save.
 - Only the workspace string and the resolved path are redacted. The dataset, layer, map and
@@ -798,15 +827,16 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - `--diff` reports no change for a password change alone, because a stored password is redacted
   before the two sides are compared.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.12.10 and 3.13.2 on
-  Windows and on 3.9.25, 3.10.21, 3.11.16, 3.12.3 and 3.13.15 on Linux, each at 356 assertions,
-  under `-W error`. It also passed, 356 assertions, on a conda clone of the ArcGIS Pro environment
-  (Python 3.13.7), but not on the stock `arcgispro-py3` environment.
-- Branch coverage is 100 percent only with the two hosts combined: 1584 statements and 374
-  branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
+  Windows and on 3.9.25, 3.10.21, 3.11.16, 3.12.3 and 3.13.15 on Linux, each at 361 assertions,
+  under `-W error`. It also passed, 361 assertions, on the stock `arcgispro-py3` environment of
+  ArcGIS Pro (Python 3.13.7) and on two conda clones of it, with and without `PYTHONNOUSERSITE=1`.
+- Branch coverage is 100 percent only with the two hosts combined: 1605 statements and 378
+  branches, measured as the lines missed by both runs, one run per host. No line is missed by both.
+  Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1452-1453) and Linux
-  never runs the `icacls` ones (1444-1451). Both hosts print the same assertion count, 356. The
-  Linux run used `coverage` 7.17.0 with its C extension, installed from PyPI into a fresh virtual
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1487-1488) and Linux
+  never runs the `icacls` ones (1479-1486). Both hosts print the same assertion count, 361. The
+  Linux run used `coverage` 7.17.3 with its C extension, installed from PyPI into a fresh virtual
   environment, because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
   on its own temporary folder. It touches no other data. A scan writes nothing: an audit hook
@@ -817,8 +847,8 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - cimscan reads the saved file, so a repoint that was never saved is invisible to it. Scan after
   the save.
 - A split finding adds no exit code of its own. A remote layer exits 3 because it is `unknown`,
-  whatever the split check says. The `.sde` workspace form (`DATABASE=...x.sde` with no `SERVER` or `INSTANCE`) is not
-  compared, and is not counted as unchecked.
+  whatever the split check says. The `.sde` workspace form (`DATABASE=...x.sde` with no `SERVER` or
+  `INSTANCE`) is compared and counted like any enterprise connection.
 - `--diff` prints `no semantic difference` for two layers whose data source the tool cannot see,
   such as a service URL held directly on the layer, because both sides give an empty source. The
   scan skips such a layer without a note.
