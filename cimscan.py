@@ -338,11 +338,15 @@ def redact(text):
             swallowing = False
             chunk = _USERINFO.sub(lambda m: m.group(1) + ":" + REDACTION + "@",
                                   chunk)
-            out.append(_SECRET_PAIR.sub(
-                lambda m: (m.group(1) + "=" + REDACTION
-                           if _secret_name(m.group(1)) else m.group(0)),
-                chunk))
+            out.append(_SECRET_PAIR.sub(_mask_pair, chunk))
     return ";".join(out)
+
+
+def _mask_pair(m):
+    """Mask a secret pair; scan an exempt (AUTHENTICATION...) value again."""
+    if _secret_name(m.group(1)):
+        return m.group(1) + "=" + REDACTION
+    return m.group(1) + "=" + _SECRET_PAIR.sub(_mask_pair, m.group(2))
 
 
 def connection_facts(connection):
@@ -2953,6 +2957,9 @@ def self_test():
         check(redact("SERVER=a;USER=u;AUTHENTICATION_MODE=DBMS")
               == "SERVER=a;USER=u;AUTHENTICATION_MODE=DBMS",
               "a connection string with no secret comes out unchanged")
+        check("hunter2" not in redact("AUTHENTICATION_MODE=x PASSWORD=hunter2")
+              and "hunter2" not in redact("AUTHENTICATION=PASSWORD=hunter2"),
+              "a secret pair inside an AUTHENTICATION value is redacted")
         check(redact("URL=https://u:p@ss@h/x")
               == "URL=https://u:%s@h/x" % REDACTION,
               "a URL password holding an at sign is redacted whole"
