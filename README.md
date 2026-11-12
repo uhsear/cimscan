@@ -87,9 +87,9 @@ PASS  a feature dataset left on the old database is two findings  <-- pinned def
 PASS  a repointed connection over a dataset still named for the old database is a finding  <-- pinned defect
 ...
 PASS  a feature dataset layer with an unqualified name could not be compared  <-- pinned defect
-PASS  the text report counts the layers it could not compare, and exits 0  <-- pinned defect
+PASS  the text report counts the layers it could not compare, and exits 3 because its sources are unknown  <-- pinned defect
 ...
-PASS  the footer and --json count the unknown sources, which exit 0  <-- pinned defect
+PASS  the footer and --json count the unknown sources, and a scan that could not tell exits 3 with no flag  <-- pinned defect
 PASS  --strict turns unknown sources into exit 3  <-- pinned defect
 PASS  a stat refused for any reason but absence is unknown, not MISSING  <-- pinned defect
 PASS  a UNC host that does not answer (winerror 53) is unknown, a share the host lacks (winerror 67) is MISSING  <-- pinned defect
@@ -98,7 +98,7 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-347 assertions, 0 failed
+356 assertions, 0 failed
 ```
 
 ## Requirements
@@ -132,12 +132,12 @@ python cimscan.py --diff before.lyrx after.lyrx
 | Flag | Default | What it does |
 |---|---|---|
 | `root` | none | Folder to walk, or one document. Required unless `--diff` or `--self-test`. An `.sde` is named and refused, see below. |
-| `--filter` | none | Report only sources whose workspace, path, dataset or layer name contains this text. |
+| `--filter` | none | Report only sources whose workspace, path, dataset, layer, map or connection type contains this text, or whose split finding does. A split finding names the feature dataset, so a filter for the old server still shows the layer that kept its name. |
 | `--json` | off | Emit the scan as JSON instead of the text report. |
 | `--diff BEFORE AFTER` | none | Compare two layer documents semantically instead of scanning a tree. Takes no folder. |
 | `--check-network` | off | Stat paths on UNC network shares. |
 | `--apply` | off | The same authorisation as `--check-network`. Nothing is ever written. The name follows the write gate of the other tools in this portfolio, and here it gates one network stat because the tool has no write to gate. |
-| `--strict` | off | Exit 3 when any shown source is `MISSING` or `unknown`, so a job does not read exit 0 as "the data is there". A `--filter` limits what it counts. |
+| `--strict` | off | Also exit 3 when any shown source is `MISSING`. A shown `unknown` source exits 3 with no flag, so a job does not read exit 0 as "the data is there". A `--filter` limits what it counts. |
 | `--self-test` | off | Run the offline assertions and exit. |
 
 The UNC check is off by default because a stat against a server that is already switched off blocks
@@ -198,9 +198,9 @@ not exist, so every layer on it would otherwise read as gone. The same document 
 and `unknown` on every host that cannot.
 
 `unknown` is neither clean nor gone: the tool could not tell. The footer counts it beside `missing`,
-and `--json` carries `missing_sources` and `unknown_sources`. A scan whose sources are all `unknown`
-still exits 0, like a scan full of `MISSING`, because exit 0 means every document parsed. A job
-that needs a verdict passes `--strict` and gets exit 3, or reads the footer. A path that cannot be statted for any reason except absence is `unknown` as
+and `--json` carries `missing_sources` and `unknown_sources`. A scan that shows any `unknown`
+source exits 3 with no flag, because exit 0 would say the data is there. A scan full of `MISSING` still exits 0 and
+`--strict` makes it 3. A path that cannot be statted for any reason except absence is `unknown` as
 well. `os.path.exists` answers False for every stat failure, so a folder behind a parent the
 scanning account may not read used to print `MISSING`. Run as a non-root user on Linux, a
 `DATABASE=blocked/inner.gdb` under a folder of mode 000 now prints `unknown`.
@@ -467,8 +467,9 @@ holds a `.` for another reason. A string that does not look like an enterprise c
 skipped. A layer with a `dataset` and no `featureDataset` is not a feature dataset layer.
 
 A finding is a finding and not a failure: it never changes the exit code, even under `--strict`.
-`--strict` exits 3 on a layer in a remote workspace only because every remote source is `unknown`,
-so a CI job cannot gate on a split finding alone and has to read the report or `--json`. The
+A layer in a remote workspace exits 3 with no flag, only because every remote source is `unknown`.
+A split finding and an all-unknown scan therefore share exit 3, so a CI job cannot gate on a split
+finding alone and has to read the report or `--json`. The
 self-test builds each case from synthetic JSON and XML connections. Five hand-made mutations of
 the check (the name comparison, the database comparison, its length guard, the shared-part slice
 and the enterprise-connection gate) each failed at least one assertion.
@@ -555,8 +556,8 @@ where a credential would otherwise reach a pull request. These files are self-te
 ## Exit codes
 
 0 every document parsed and every directory listed, 1 at least one `UNSUPPORTED` or at least one
-directory that could not be listed, 2 the scan path does not exist, 3 `--strict` was given and a
-shown source is `MISSING` or `unknown` (exit 1 wins when both hold), 64 usage error. Usage error
+directory that could not be listed, 2 the scan path does not exist, 3 a shown source is `unknown`, or
+`--strict` was given and a shown source is `MISSING` (exit 1 wins when both hold), 64 usage error. Usage error
 covers no root, `--diff` with a folder, and every argument the parser rejects: an unknown flag, a
 prefix such as `--ap`, `--diff` without two documents. The parser's own default for these is 2, so
 it is overridden and 2 always means a missing path. A root folder that exists and cannot be listed
@@ -623,9 +624,9 @@ Two format facts cost more time than anything else here, and both are pinned by 
   a deliberately malicious document can still cost memory through nested internal entities. Scan
   trees of ordinary files you own: a document that is a FIFO or a device would block the read, and a
   huge or zip-bomb document is read fully into memory. Neither is guarded against.
-- A plain scan exits 0 whatever it finds: a scan full of `MISSING` or `unknown` sources still exits
-  0, because exit 1 means only that something could not be read. `--strict` exits 3 when any shown
-  source is `MISSING` or `unknown`, and that is the one flag a CI job can fail on.
+- A plain scan exits 3 when any shown source is `unknown`, because every remote database layer is
+  `unknown` and exit 0 would call it clean. A scan whose sources are all `MISSING` exits 0, because
+  exit 1 means only that something could not be read. `--strict` adds `MISSING` to the exit 3 cases.
 - An unreadable directory is reported once, by the path the walk was refused. Its subfolders are
   never reached, so one line can stand for a whole branch of the tree.
 - Symlinked folders are never descended, and the footer does not count them.
@@ -759,6 +760,14 @@ Two format facts cost more time than anything else here, and both are pinned by 
   instead, so it is not affected.
 - `--apply` writes nothing. It only authorises the one outbound stat, so the name does not mean a
   destructive step, and no flag of this tool writes a file.
+- The mutation claim in "Split workspaces" (five hand-made mutations, each failed by an assertion)
+  was a manual run. The four shipped files do not reproduce it.
+- A layer with no `dataConnection` object that cimscan can find, such as a service URL held
+  directly on the layer, is skipped with no note in a scan too. A document holding only such layers
+  reports `OK` with `(no data sources read)` and exits 0.
+- A secret written in JSON form, such as `CONNECTION_PROPERTIES={"token":"..."}`, prints as stored,
+  because redaction matches only `NAME=value` pairs. This sits beside `AUTH`, `OAUTH`, `COOKIE` and
+  `code=` above.
 - No Esri sentence says that the Pro broken flag is reliable only after a save and reopen, so this
   README does not state it. Scan after the save.
 - Only the workspace string and the resolved path are redacted. The dataset, layer, map and
@@ -782,25 +791,26 @@ Two format facts cost more time than anything else here, and both are pinned by 
   leading backslash resolves against the current drive and, on Windows, reads `MISSING` when it is absent.
 - `--diff` reports no change for a password change alone, because a stored password is redacted
   before the two sides are compared.
-- Python 3.9 is the stated floor. The self-test ran green on 3.11.8 (the ArcGIS Pro
-  interpreter), 3.12.10, 3.13.2 and 3.13.7 on Windows and on 3.9.25, 3.10.21, 3.11.16 and 3.12.3 on
-  Linux, each at 347 assertions, under `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1513 statements and 352
+- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.12.10 and 3.13.2 on
+  Windows and on 3.9.25, 3.10.21, 3.11.16, 3.12.3 and 3.13.15 on Linux, each at 356 assertions,
+  under `-W error`. It was not re-run on the ArcGIS Pro interpreter.
+- Branch coverage is 100 percent only with the two hosts combined: 1584 statements and 374
   branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1381-1382) and Linux
-  never runs the `icacls` ones (1373-1380). Both hosts print the same assertion count, 347. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1452-1453) and Linux
+  never runs the `icacls` ones (1444-1451). Both hosts print the same assertion count, 356. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
   on its own temporary folder. It touches no other data. A scan writes nothing: an audit hook
   over `--json`, `--apply`, `--check-network` and `--diff` runs recorded no write open, no
-  subprocess and no socket. Killing the self-test mid-run, for example with `taskkill`, can leave a
+  subprocess and no socket. That hook run was ad hoc and is not part of the shipped self-test.
+  Killing the self-test mid-run, for example with `taskkill`, can leave a
   locked `cimscan-test-*` folder in the temp directory.
 - cimscan reads the saved file, so a repoint that was never saved is invisible to it. Scan after
   the save.
-- Findings from the split check never change the exit code, and `splitUnchecked` layers do not
-  either. The `.sde` workspace form (`DATABASE=...x.sde` with no `SERVER` or `INSTANCE`) is not
+- A split finding adds no exit code of its own. A remote layer exits 3 because it is `unknown`,
+  whatever the split check says. The `.sde` workspace form (`DATABASE=...x.sde` with no `SERVER` or `INSTANCE`) is not
   compared, and is not counted as unchecked.
 - `--diff` prints `no semantic difference` for two layers whose data source the tool cannot see,
   such as a service URL held directly on the layer, because both sides give an empty source. The

@@ -983,8 +983,11 @@ def matches_filter(source, text):
     if not text:
         return True
     needle = text.lower()
-    for field in (source.workspace, source.path, source.dataset,
-                  source.layer, source.container, source.kind):
+    # A split finding names the feature dataset, which no other field holds, so
+    # a grep for the old server must still reach the layer that kept its name.
+    for field in ((source.workspace, source.path, source.dataset,
+                   source.layer, source.container, source.kind)
+                  + tuple(source.split)):
         if field and needle in str(field).lower():
             return True
     return False
@@ -3080,6 +3083,11 @@ def self_test():
         code, out = run([split_path, "--filter", "Mains"])
         check("split workspace" not in out,
               "--filter hides the findings of a layer it hides")
+        code, out = run([split_path, "--filter", "olddb"])
+        check(out.count("! split workspace:") == 2 and code == 3,
+              "--filter on a name only the feature dataset holds still shows "
+              "the split layer, and the scan is not a clean exit 0  "
+              "<-- pinned defect")
         code, out, _err = capture([split_path, "--json"])
         payload = json.loads(out)["documents"][0]["sources"]
         check([len(s["split"]) for s in payload] == [2, 0]
