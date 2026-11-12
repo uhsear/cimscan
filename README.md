@@ -104,7 +104,7 @@ PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinne
 ## Requirements
 
 Python 3.9 or newer, run on 3.9, 3.10, 3.11, 3.12 and 3.13. Standard library only: `zipfile`, `xml.etree.ElementTree`, `json`, `os`, `re`,
-`argparse`. No `arcpy`, no ArcGIS licence, no install step. It runs on ArcGIS Pro's Python and on a
+`argparse`. No `arcpy`, no ArcGIS licence, no install step. It ran on a conda clone of ArcGIS Pro's Python (see Limits) and on a
 plain `python3` on a file server.
 
 ```
@@ -734,7 +734,13 @@ Two format facts cost more time than anything else here, and both are pinned by 
   is not ASCII reads `unknown`, and I tested the catalog layout on one GDAL-written geodatabase and
   not on one written by ArcGIS Pro.
 - A service layer keeps its URL in a nested `serverConnection`, so its row shows `(no dataset)`:
-  `objectName` is not read from the outer connection.
+  `objectName` is not read from the outer connection. The outer connection's own `MapServer` URL is
+  dropped, so only the inner server URL shows and `--filter MapServer` does not find it.
+- `--diff` exits 0 whether or not it prints a change, so read its output or use `--json`. Only a
+  damaged or unreadable input gives exit 1.
+- A secret under `PSW=`, written as `password:value`, or written as `//user:pw@host` prints as stored.
+- A dangling layer reference prints in the `UNSUPPORTED` note as stored, without redaction, as the
+  dataset, layer and map fields do.
 - A filtered scan hides an `[OK]` document that matched nothing. A `--filter` match also reads the
   resolved path, so a document stored in a folder whose name holds the filter text matches on every
   relative workspace.
@@ -793,14 +799,15 @@ Two format facts cost more time than anything else here, and both are pinned by 
   before the two sides are compared.
 - Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.12.10 and 3.13.2 on
   Windows and on 3.9.25, 3.10.21, 3.11.16, 3.12.3 and 3.13.15 on Linux, each at 356 assertions,
-  under `-W error`. It was not re-run on the ArcGIS Pro interpreter.
+  under `-W error`. It also passed, 356 assertions, on a conda clone of the ArcGIS Pro environment
+  (Python 3.13.7), but not on the stock `arcgispro-py3` environment.
 - Branch coverage is 100 percent only with the two hosts combined: 1584 statements and 374
   branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
   Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1452-1453) and Linux
   never runs the `icacls` ones (1444-1451). Both hosts print the same assertion count, 356. The
-  Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
-  because a stock server `python3` lacks the module.
+  Linux run used `coverage` 7.17.0 with its C extension, installed from PyPI into a fresh virtual
+  environment, because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
   on its own temporary folder. It touches no other data. A scan writes nothing: an audit hook
   over `--json`, `--apply`, `--check-network` and `--diff` runs recorded no write open, no
