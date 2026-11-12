@@ -92,12 +92,13 @@ PASS  the text report counts the layers it could not compare, and exits 0  <-- p
 PASS  the footer and --json count the unknown sources, which exit 0  <-- pinned defect
 PASS  --strict turns unknown sources into exit 3  <-- pinned defect
 PASS  a stat refused for any reason but absence is unknown, not MISSING  <-- pinned defect
+PASS  a UNC host that does not answer (winerror 53) is unknown, a share the host lacks (winerror 67) is MISSING  <-- pinned defect
 ...
 PASS  a dropped feature class in a geodatabase that is there is MISSING, one the catalog cannot answer for is unknown  <-- pinned defect
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-344 assertions, 0 failed
+345 assertions, 0 failed
 ```
 
 ## Requirements
@@ -203,6 +204,16 @@ that needs a verdict passes `--strict` and gets exit 3, or reads the footer. A p
 well. `os.path.exists` answers False for every stat failure, so a folder behind a parent the
 scanning account may not read used to print `MISSING`. Run as a non-root user on Linux, a
 `DATABASE=blocked/inner.gdb` under a folder of mode 000 now prints `unknown`.
+
+On Windows a UNC host that is switched off or misnamed fails the stat with `FileNotFoundError`,
+the same class as an absent file. Python exposes the Windows error code as `winerror`. Code 53,
+`ERROR_BAD_NETPATH` ("The network path was not found"), means the host did not answer, so it reads
+`unknown`. Code 67, `ERROR_BAD_NET_NAME` ("The network name cannot be found"), means a host
+answered and has no such share, so it reads `MISSING`. Both codes are listed on Microsoft's
+[System Error Codes (0-499)](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)
+page. I confirmed on Windows that a stat of a share on `192.0.2.1` and of one on an unknown
+host name both raise 53, and that a stat of a missing share on `localhost` raises 67. An unreachable host can still take the full SMB timeout
+(about 21 seconds for `192.0.2.1`) before it answers `unknown`.
 
 Sources are then grouped by workspace, because four layers on one `.sde` are one decommissioning
 decision and not four. The fixture project the self-test builds is a zip of CIM XML parts. A
@@ -388,9 +399,11 @@ layer, so this tool only reports the disagreement and claims nothing about how P
 
 What the Esri documentation says, and what the check rests on:
 
-- A layer in a feature dataset has a `CIMFeatureDatasetDataConnection`. It is a standard data
-  connection (`workspaceConnectionString`, `dataset`) plus one string member, `featureDataset`
-  ([Esri cim-spec](https://github.com/Esri/cim-spec/blob/main/docs/v3/CIMVectorLayers.md#cimfeaturedatasetdataconnection)).
+- A layer in a feature dataset has a `CIMFeatureDatasetDataConnection`. The specification lists a
+  `featureDataset` string member on it
+  ([Esri cim-spec](https://github.com/Esri/cim-spec/blob/main/docs/v3/CIMVectorLayers.md#cimfeaturedatasetdataconnection))
+  and does not say which class it extends. This tool reads `workspaceConnectionString` and
+  `dataset` from it as it does from any other connection.
   The connection holds one workspace string. A second workspace is not a member of it, so a split
   cannot be a second connection string.
 - In an enterprise geodatabase, the `dataset` of a layer is a qualified name. Esri's sample reads
@@ -453,7 +466,9 @@ A file or folder workspace is never checked and never counted, because a shapefi
 holds a `.` for another reason. A string that does not look like an enterprise connection is
 skipped. A layer with a `dataset` and no `featureDataset` is not a feature dataset layer.
 
-A finding is a finding and not a failure: it does not change the exit code, like `MISSING`. The
+A finding is a finding and not a failure: it never changes the exit code, even under `--strict`.
+`--strict` exits 3 on a layer in a remote workspace only because every remote source is `unknown`,
+so a CI job cannot gate on a split finding alone and has to read the report or `--json`. The
 self-test builds each case from synthetic JSON and XML connections. Five hand-made mutations of
 the check (the name comparison, the database comparison, its length guard, the shared-part slice
 and the enterprise-connection gate) each failed at least one assertion.
@@ -603,8 +618,9 @@ Two format facts cost more time than anything else here, and both are pinned by 
   a deliberately malicious document can still cost memory through nested internal entities. Scan
   trees of ordinary files you own: a document that is a FIFO or a device would block the read, and a
   huge or zip-bomb document is read fully into memory. Neither is guarded against.
-- Findings never change the exit code. A scan full of `MISSING` sources exits 0, because exit 1 means
-  only that something could not be read. There is no flag to fail a CI job on `MISSING`.
+- A plain scan exits 0 whatever it finds: a scan full of `MISSING` or `unknown` sources still exits
+  0, because exit 1 means only that something could not be read. `--strict` exits 3 when any shown
+  source is `MISSING` or `unknown`, and that is the one flag a CI job can fail on.
 - An unreadable directory is reported once, by the path the walk was refused. Its subfolders are
   never reached, so one line can stand for a whole branch of the tree.
 - Symlinked folders are never descended, and the footer does not count them.
@@ -752,14 +768,14 @@ Two format facts cost more time than anything else here, and both are pinned by 
   leading backslash resolves against the current drive and, on Windows, reads `MISSING` when it is absent.
 - `--diff` reports no change for a password change alone, because a stored password is redacted
   before the two sides are compared.
-- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.12 and 3.13.2 on
-  Windows and on 3.12.3 on Linux, each at 344 assertions, under `-W error`. A Python 3.11 run was
-  not repeated.
-- Branch coverage is 100 percent only with the two hosts combined: 1482 statements and 344
+- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.8 (the ArcGIS Pro
+  interpreter), 3.12 and 3.13.2 on Windows and on 3.12.3 on Linux, each at 345 assertions, under
+  `-W error`.
+- Branch coverage is 100 percent only with the two hosts combined: 1493 statements and 344
   branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1364-1365) and Linux
-  never runs the `icacls` ones (1356-1363). Both hosts print the same assertion count, 344. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1372-1373) and Linux
+  never runs the `icacls` ones (1364-1371). Both hosts print the same assertion count, 345. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`
@@ -767,6 +783,26 @@ Two format facts cost more time than anything else here, and both are pinned by 
   over `--json`, `--apply`, `--check-network` and `--diff` runs recorded no write open, no
   subprocess and no socket. Killing the self-test mid-run, for example with `taskkill`, can leave a
   locked `cimscan-test-*` folder in the temp directory.
+- cimscan reads the saved file, so a repoint that was never saved is invisible to it. Scan after
+  the save.
+- Findings from the split check never change the exit code, and `splitUnchecked` layers do not
+  either. The `.sde` workspace form (`DATABASE=...x.sde` with no `SERVER` or `INSTANCE`) is not
+  compared, and is not counted as unchecked.
+- `--diff` prints `no semantic difference` for two layers whose data source the tool cannot see,
+  such as a service URL held directly on the layer, because both sides give an empty source. The
+  scan skips such a layer without a note.
+- A layer name, dataset or workspace that holds a newline or carriage return prints raw in the text
+  report, so a crafted document can forge a report line such as a fake `OK` row. Scan only
+  documents you trust, or use `--json`.
+- Opening a UNC or mapped-drive path that a document names makes Windows connect to that host and
+  can send NTLM credentials. The mapped-drive probe, a stat of the drive root, runs even without
+  `--check-network`, and a disconnected mapped drive can block for the SMB timeout.
+- A OneDrive or other cloud-placeholder document is read in full, which makes the sync client
+  download it. The tool does not detect placeholders.
+- A JSON document nested deeper than the Python recursion limit (900 levels failed here) is
+  reported `UNSUPPORTED` with `maximum recursion depth exceeded` and is not parsed.
+- A password that itself contains `;SERVER=` or `;USER=` leaks the text after that key, because the
+  redaction splits the string on `;`.
 - A layer name holding characters the console codepage cannot encode prints as `?`. The scan
   finishes; `--json` written to a file keeps the real name.
 

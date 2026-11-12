@@ -23,7 +23,8 @@ python3. It knows less than arcpy does. It runs where arcpy cannot.
     python cimscan.py --diff before.lyrx after.lyrx
 
 Exit codes: 0 every document parsed and every folder listed, 1 at least one
-UNSUPPORTED document or unlistable folder, 2 the scan path does not exist, 64
+UNSUPPORTED document or unlistable folder, 2 the scan path does not exist, 3
+--strict and a shown source is MISSING or unknown (1 wins when both hold), 64
 usage error.
 """
 
@@ -530,17 +531,24 @@ def is_network_path(path):
     return path.startswith("\\\\") or path.startswith("//")
 
 
-def path_exists(path):
+def path_exists(path, stat=None):
     """True, False, or None when the stat failed for a reason other than absence.
 
     os.path.exists answers False for every stat failure, a refused read of a
     parent folder included, and the report then says MISSING about data that is
     there. Only "no such file or directory" means absent. A path that cannot
     exist, such as one holding a NUL character, is absent too.
+
+    Windows reports a UNC host that does not answer as FileNotFoundError too,
+    with winerror 53 (ERROR_BAD_NETPATH, "The network path was not found").
+    That says nothing about the data, so it is unknown. Winerror 67
+    (ERROR_BAD_NET_NAME) is a host that answered and has no such share: absent.
     """
     try:
-        os.stat(path)
-    except (FileNotFoundError, NotADirectoryError, ValueError):
+        (stat or os.stat)(path)
+    except FileNotFoundError as exc:
+        return None if getattr(exc, "winerror", None) == 53 else False
+    except (NotADirectoryError, ValueError):
         return False
     except OSError:
         return None
@@ -3074,6 +3082,20 @@ def self_test():
               and path_exists(workdir + "\0x") is False,
               "a stat refused for any reason but absence is unknown, not "
               "MISSING  <-- pinned defect")
+        def no_host(_path):
+            error = FileNotFoundError(2, "The network path was not found")
+            error.winerror = 53
+            raise error
+
+        def no_share(_path):
+            error = FileNotFoundError(2, "The network name cannot be found")
+            error.winerror = 67
+            raise error
+        check(path_exists("x", no_host) is None
+              and path_exists("x", no_share) is False,
+              "a UNC host that does not answer (winerror 53) is unknown, a "
+              "share the host lacks (winerror 67) is MISSING  <-- pinned "
+              "defect")
         check(check_presence(workdir, False, lambda _p: None) is None,
               "check_presence passes an unknown stat on")
 
@@ -3186,8 +3208,9 @@ def _parse(argv):
     parser.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"),
                         default=None,
                         help="compare two layer documents semantically instead "
-                             "of scanning a tree: source, definition query, "
-                             "renderer field, connection type")
+                             "of scanning a tree: source, feature dataset, "
+                             "definition query, renderer field, connection "
+                             "type")
     parser.add_argument("--check-network", dest="check_network",
                         action="store_true",
                         help="stat paths on UNC network shares. Off by default "
