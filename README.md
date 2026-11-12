@@ -98,7 +98,7 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-345 assertions, 0 failed
+347 assertions, 0 failed
 ```
 
 ## Requirements
@@ -544,6 +544,11 @@ renderer field changed: Events
 3 change(s)
 ```
 
+A document whose layer list names a part that does not exist is damaged. `--diff` still sweeps
+the layers no root names and reports what it finds, then prints each dangling reference to stderr
+and exits 1, as a scan marks the same file `UNSUPPORTED`. A repoint behind a stale list is no
+longer reported as `no semantic difference`.
+
 Any stored password in a repointed connection is redacted here too. A `.lyrx` review is exactly
 where a credential would otherwise reach a pull request. These files are self-test fixtures.
 
@@ -669,6 +674,15 @@ Two format facts cost more time than anything else here, and both are pinned by 
   the document reports `OK` with no sources.
 - A drive-relative workspace such as `C:parcels.gdb` is checked against the current directory on
   that drive of the scanning host, so the verdict depends on where the scan runs.
+- A credential written as the whole user part of a URL, such as `https://abc123@host`, prints as
+  stored, because only `user:password@` is recognised.
+- A quoted `DATABASE=` value in a file geodatabase workspace is not unquoted. The path keeps its
+  quote marks, is resolved against the document folder and reads `MISSING`.
+- Redaction time is cubic on one long string full of key markers: `DATABASE=C:/` followed by
+  `passkey` repeated to 2000 characters took 5.9 s, and 4000 characters took 46.5 s, on Windows.
+- No exit code reports a split finding. Gate on `split` and `splitUnchecked` in `--json`.
+- Whether Pro marks a layer broken only after a save and reopen is not in Esri documentation, so
+  cimscan does not rely on it. Scan after the save.
 - A secret key name with a tab or other whitespace before the `=`, an unencoded `/` or `;` in a URL
   password, and a secret under a name that is not on the denylist, such as `AUTH`, `OAUTH`, `COOKIE` or a
   `code=` query parameter, print as stored. A `#` inside a token value ends the redacted value, so
@@ -768,14 +782,14 @@ Two format facts cost more time than anything else here, and both are pinned by 
   leading backslash resolves against the current drive and, on Windows, reads `MISSING` when it is absent.
 - `--diff` reports no change for a password change alone, because a stored password is redacted
   before the two sides are compared.
-- Python 3.9 is the stated floor. The self-test ran green on 3.9.25, 3.10.20, 3.11.8 (the ArcGIS Pro
-  interpreter), 3.12 and 3.13.2 on Windows and on 3.12.3 on Linux, each at 345 assertions, under
-  `-W error`.
-- Branch coverage is 100 percent only with the two hosts combined: 1493 statements and 344
+- Python 3.9 is the stated floor. The self-test ran green on 3.11.8 (the ArcGIS Pro
+  interpreter), 3.12.10, 3.13.2 and 3.13.7 on Windows and on 3.9.25, 3.10.21, 3.11.16 and 3.12.3 on
+  Linux, each at 347 assertions, under `-W error`.
+- Branch coverage is 100 percent only with the two hosts combined: 1513 statements and 352
   branches, measured as the union of the missed lines of one run per host. Each host alone is 99 percent.
   `_deny_read`, the self-test helper that makes a folder unlistable, has an `icacls` branch for
-  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1372-1373) and Linux
-  never runs the `icacls` ones (1364-1371). Both hosts print the same assertion count, 345. The
+  Windows and a `chmod` branch for POSIX. Windows never runs the `chmod` lines (1381-1382) and Linux
+  never runs the `icacls` ones (1373-1380). Both hosts print the same assertion count, 347. The
   Linux run used `coverage` 7.16.1's pure-Python tracer, copied from the Windows environment,
   because a stock server `python3` lacks the module.
 - The self-test writes temporary fixtures to the system temp folder, and runs `icacls` or `chmod`

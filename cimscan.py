@@ -951,17 +951,26 @@ def layer_signature(node):
     }
 
 
-def diff_documents(before, after):
+def diff_documents(before, after, dangling=None):
     """Semantic differences between two parsed layer documents.
 
     A .lyrx is a whole JSON document for one layer, and a real one
     runs to hundreds of lines. Re-saving one in Pro rewrites its uri, so a
     textual diff reports a change even when nothing a reviewer cares about
     moved. These five fields are what the review is actually about.
+
+    Like a scan, the walk sweeps up a layer part that no root names, and it
+    appends a reference that names no part to the optional dangling list. A
+    stale root list otherwise hides every layer, and a repoint then reads as
+    no difference.
     """
     def summaries(root):
         parts, roots = document_parts(root)
-        layers, _visited = walk_layers(parts, roots)
+        layers, visited = walk_layers(parts, roots, dangling=dangling)
+        leftovers = [n for n in sorted(parts) if n not in visited]
+        if leftovers:
+            extra, _visited = walk_layers(parts, leftovers, visited, dangling)
+            layers.extend(extra)
         out = {}
         seen = {}
         for _container, name, node in layers:
@@ -2590,6 +2599,33 @@ def self_test():
               "--diff with a third argument is a usage error  "
               "<-- pinned defect")
 
+        # ---- --diff does not call a damaged document clean
+        stale = []
+        for dataset in ("A", "B"):
+            target = os.path.join(joindir, "Stale%s.lyrx" % dataset)
+            handle = open(target, "w")
+            handle.write(json.dumps({
+                "type": "CIMLayerDocument", "layers": ["CIMPATH=gone.json"],
+                "layerDefinitions": [{
+                    "type": "CIMFeatureLayer", "name": "L",
+                    "uri": "CIMPATH=l.json",
+                    "featureTable": {"dataConnection": {
+                        "type": "CIMStandardDataConnection",
+                        "workspaceConnectionString": "DATABASE=x.gdb",
+                        "dataset": dataset}}}]}))
+            handle.close()
+            stale.append(target)
+        code, out = run(["--diff", stale[0], stale[1]])
+        check(code == 1 and "source repointed: L" in out
+              and "names no part of the document: CIMPATH=gone.json" in out,
+              "--diff sees a repoint behind a stale root list and exits 1  "
+              "<-- pinned defect")
+        dangling_seen = []
+        check(diff_documents({"type": "CIMLayerDocument", "layers": ["CIMPATH=x"]},
+                             {"type": "CIMLayerDocument", "layers": []},
+                             dangling_seen) == [] and dangling_seen == ["CIMPATH=x"],
+              "diff_documents hands back the references that name no part")
+
         # ---- a Windows path read on a POSIX host is unknown, not MISSING
         gone = lambda _p: False
         mapped = lambda p: p == "C:\\"
@@ -3253,7 +3289,8 @@ def _run_diff(args):
             print("error: %s is %s: %s" % (path, UNSUPPORTED, exc),
                   file=sys.stderr)
             return 1
-    changes = diff_documents(documents[0], documents[1])
+    dangling = []
+    changes = diff_documents(documents[0], documents[1], dangling)
     if args.json:
         print(json.dumps([{"change": c[0], "layer": c[1],
                            "before": c[2], "after": c[3]} for c in changes],
@@ -3261,6 +3298,12 @@ def _run_diff(args):
     else:
         for line in diff_lines(changes):
             print(line)
+    if dangling:
+        # A damaged document hides layers, so no answer above is a clean one.
+        for reference in sorted(set(dangling)):
+            print("error: %s: a layer reference names no part of the "
+                  "document: %s" % (UNSUPPORTED, reference), file=sys.stderr)
+        return 1
     return 0
 
 
