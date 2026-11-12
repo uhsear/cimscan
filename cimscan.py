@@ -22,10 +22,10 @@ python3. It knows less than arcpy does. It runs where arcpy cannot.
     python cimscan.py \\\\fileserver\\projects --json > sources.json
     python cimscan.py --diff before.lyrx after.lyrx
 
-Exit codes: 0 every document parsed and every folder listed, 1 at least one
-UNSUPPORTED document or unlistable folder, 2 the scan path does not exist, 3
---strict and a shown source is MISSING or unknown (1 wins when both hold), 64
-usage error.
+Exit codes: 0 every document parsed, every folder listed and every shown source
+checked, 1 at least one UNSUPPORTED document or unlistable folder, 2 the scan
+path does not exist, 3 a shown source is unknown, or with --strict MISSING too
+(1 wins when both hold), 64 usage error.
 """
 
 from __future__ import print_function
@@ -257,7 +257,7 @@ _USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/:@\s;?#]*):[^/\s;?#]*@")
 
 # Non-secret property names an Esri connection string carries. After a secret
 # property, a chunk with "=" is the rest of the password unless its key is on
-# this list, so an unlisted key is over-redacted and never leaked.
+# this list, so an unlisted key is over-redacted, not printed.
 _CONNECTION_KEYS = frozenset((
     "SERVER", "INSTANCE", "DATABASE", "USER", "AUTHENTICATION_MODE",
     "DBCLIENT", "DB_CONNECTION_PROPERTIES", "PROJECT_INSTANCE", "VERSION",
@@ -276,7 +276,7 @@ def _split_properties(text):
 
     A quote opens only straight after "=", so an apostrophe in a path does not
     swallow the rest of the string. An unclosed quote runs to the end, which
-    over-redacts and never leaks.
+    over-redacts.
     """
     chunks, current, quote = [], [], None
     for index, char in enumerate(text):
@@ -483,6 +483,20 @@ def split_unchecked(connection):
     return first != second
 
 
+def _nt_namespace(path):
+    """The part after an NT namespace prefix (backslash, two question marks,
+    backslash), or "" for any other path.
+
+    That prefix spells a UNC share as the NT namespace does. Python 3.12 and
+    earlier call such a path absolute and Windows contacts the host, so it is
+    read as the network path it is. Python 3.13 calls it relative.
+    """
+    flat = path.replace("/", chr(92))
+    if flat[:4] == chr(92) + "??" + chr(92):
+        return flat[4:]
+    return ""
+
+
 def is_windows_absolute(path):
     r"""True for a drive-letter or UNC path, whatever host is reading it.
 
@@ -494,7 +508,7 @@ def is_windows_absolute(path):
     """
     if not path:
         return False
-    if path[:2] in ("//", chr(92) * 2):
+    if path[:2] in ("//", chr(92) * 2) or _nt_namespace(path):
         return True
     return len(path) > 2 and path[1] == ":" and path[2] in ("/", chr(92))
 
@@ -528,7 +542,12 @@ def is_network_path(path):
     """True for a UNC path, whose existence check goes out over the wire."""
     if not path:
         return False
-    return path.startswith("\\\\") or path.startswith("//")
+    if path.startswith("\\\\") or path.startswith("//"):
+        return True
+    # The NT spelling of a local drive is a local path. Every other NT name,
+    # UNC or a device that leads to a share, may leave the machine.
+    rest = _nt_namespace(path)
+    return bool(rest) and rest[1:2] != ":"
 
 
 def path_exists(path, stat=None):
@@ -632,6 +651,49 @@ def read_catalog(path):
     try:
         with open(os.path.join(path, "a00000001.gdbtable"), "rb") as handle:
             return handle.read()
+    except OSError:
+        return None
+
+
+# Dataset names that are a file in a folder workspace. A shapefile layer names
+# its dataset with or without the extension, so a name that ends in one of
+# these, or any name on a Shapefile workspace, is looked for as a file.
+FILE_DATASET_EXTENSIONS = (".shp", ".dbf", ".csv", ".txt")
+
+
+def dataset_files(dataset, factory):
+    """The file names a folder workspace must hold for this dataset, or ().
+
+    An empty tuple means "not a file dataset, ask nothing about it". The
+    folder check applies to a name with a file extension, or to any name on a
+    Shapefile workspace, where "roads" means roads.shp (a standalone table
+    means roads.dbf). A name with a path separator is not looked for.
+    """
+    name = (dataset or "").strip().lower()
+    if not name or "/" in name or chr(92) in name:
+        return ()
+    if name.endswith(FILE_DATASET_EXTENSIONS):
+        return (name,)
+    if str(factory or "").strip().lower() == "shapefile":
+        return (name + ".shp", name + ".dbf")
+    return ()
+
+
+def dataset_in_folder(listing, wanted):
+    """Whether a folder holds one of the wanted files: True, False, or None.
+
+    The listing is the folder's lower-cased file names, or None when the folder
+    could not be listed. Windows file names ignore case, so the match does too.
+    """
+    if listing is None:
+        return None
+    return any(name in listing for name in wanted)
+
+
+def read_folder(path):
+    """The lower-cased file names in a folder, or None if it cannot be listed."""
+    try:
+        return frozenset(name.lower() for name in os.listdir(path))
     except OSError:
         return None
 
@@ -828,7 +890,8 @@ def walk_layers(parts, roots, visited=None, dangling=None):
 
 
 def collect_sources(document, parts, roots, home, check_network,
-                    exists=path_exists, catalog=read_catalog, dangling=None):
+                    exists=path_exists, catalog=read_catalog, dangling=None,
+                    listing=read_folder):
     """Turn a parsed document into its Source records.
 
     Maps are walked first so every layer is attributed to the map that holds it,
@@ -837,7 +900,9 @@ def collect_sources(document, parts, roots, home, check_network,
     it is wrong.
 
     A file geodatabase that is there is also asked whether it lists the dataset,
-    because a dropped feature class leaves the folder behind.
+    because a dropped feature class leaves the folder behind. A folder workspace
+    is asked whether it still holds the shapefile or table file the layer names,
+    because a deleted shapefile leaves the folder behind too.
     """
     sources = []
     map_roots = [n for n in sorted(parts)
@@ -863,6 +928,10 @@ def collect_sources(document, parts, roots, home, check_network,
             present = check_presence(path, check_network, exists)
             if present and path.lower().endswith(".gdb") and dataset:
                 present = dataset_in_catalog(catalog(path), dataset)
+            elif present and dataset:
+                wanted = dataset_files(dataset, leaf.get("workspacefactory"))
+                if wanted:
+                    present = dataset_in_folder(listing(path), wanted)
             sources.append(Source(
                 document=document,
                 container=container or "(no map)",
@@ -1165,17 +1234,15 @@ def report_lines(documents, text_filter=None, unreadable=()):
     return lines
 
 
-def unverified_sources(documents, text_filter=None):
-    """How many shown sources are MISSING or unknown, the --strict count.
+def unverified_sources(documents, text_filter=None, states=(UNKNOWN,)):
+    """How many shown sources are in one of the given states, the exit-3 count.
 
-    Exit 0 says every document parsed. It never said the data is there, and a
-    scan of nothing but remote databases reads every source as unknown. A job
-    that needs a verdict asks for --strict and gets a nonzero exit instead of
-    having to parse the footer.
+    Exit 0 must not mean "nobody could tell". A scan of nothing but remote
+    databases reads every source as unknown, so any unknown source ends the run
+    with exit 3. --strict adds MISSING to the states that count.
     """
     return sum(1 for d in documents for s in d.sources
-               if matches_filter(s, text_filter)
-               and s.state in (MISSING, UNKNOWN))
+               if matches_filter(s, text_filter) and s.state in states)
 
 
 def json_report(documents, text_filter=None, root=None, unreadable=()):
@@ -1236,10 +1303,11 @@ FIXTURE_GDB = "DATABASE=..\\commondata\\parcels.gdb"
 # The property set Pro writes into a document for a saved .sde connection that
 # stores its credential: the whole set, in the order Pro emits it, with both
 # password blobs. The short FIXTURE_SDE above is the readable one; this is the
-# shape the redaction actually meets on a shared drive.
+# shape the redaction actually meets on a shared drive. Every value is made up:
+# the two blobs keep only the "00022e68" header, then count 0123456789.
 FIXTURE_SDE_REAL = (
-    "ENCRYPTED_PASSWORD=00022e6844ca3f1ab7d59c0e18a5;"
-    "ENCRYPTED_PASSWORD_UTF8=00022e68e1f40c7b25d3;"
+    "ENCRYPTED_PASSWORD=00022e680123456789012345;"
+    "ENCRYPTED_PASSWORD_UTF8=00022e680123456789ab;"
     "SERVER=dbhost1;INSTANCE=sde:sqlserver:dbhost1\\SQLEXPRESS;"
     "DBCLIENT=sqlserver;DB_CONNECTION_PROPERTIES=dbhost1\\SQLEXPRESS;"
     "DATABASE=warehouse1;USER=viewer_acct;AUTHENTICATION_MODE=DBMS;"
@@ -1591,16 +1659,21 @@ def self_test():
     tally = _Tally()
     check, raises = tally.check, tally.raises
 
-    def run(argv):
-        """main() with both streams captured, returning (exit code, output)."""
-        buffer = io.StringIO()
+    def capture(argv):
+        """main() with each stream captured: (exit code, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
         saved = (sys.stdout, sys.stderr)
-        sys.stdout, sys.stderr = buffer, buffer
+        sys.stdout, sys.stderr = out, err
         try:
             code = main(argv)
         finally:
             sys.stdout, sys.stderr = saved
-        return code, buffer.getvalue()
+        return code, out.getvalue(), err.getvalue()
+
+    def run(argv):
+        """main() with both streams captured, returning (exit code, output)."""
+        code, out, err = capture(argv)
+        return code, out + err
 
     print("cimscan self-test: no arcpy, no licence, no network")
     print("-" * 68)
@@ -2313,18 +2386,20 @@ def self_test():
                     "dataset": "Parcels"}}}]}))
         handle.close()
         code, out = run([unc])
-        check(code == 0 and UNKNOWN in out and MISSING not in out,
+        check(code == 3 and UNKNOWN in out and MISSING not in out,
               "a UNC source is unknown while the network check is off")
         # A POSIX host cannot evaluate a Windows path, so there the flag changes
         # nothing and the verdict stays unknown. One assertion, both hosts.
         code, out = run([unc, "--check-network"])
-        check(code == 0 and (MISSING in out) == (os.name == "nt"),
+        check(code == (0 if os.name == "nt" else 3)
+              and (MISSING in out) == (os.name == "nt"),
               "--check-network stats it for real on Windows, MISSING there")
         code, out = run([unc, "--apply"])
-        check(code == 0 and (MISSING in out) == (os.name == "nt"),
+        check(code == (0 if os.name == "nt" else 3)
+              and (MISSING in out) == (os.name == "nt"),
               "--apply authorises that same stat, which is all --apply does")
         code, out = run([mapx, "--apply"])
-        check(code == 0 and "Owner Lookup" in out,
+        check(code == 3 and "Owner Lookup" in out,
               "and it scans the document exactly as it would without the flag")
         code, out = run([])
         check(code == 64, "no argument at all is a usage error")
@@ -2534,7 +2609,7 @@ def self_test():
         check(any("olddb" in s.workspace for s in join_doc.sources),
               "the server behind the join is in the report")
         code, out = run([joindir, "--filter", "olddb"])
-        check(code == 0 and "1 source(s)" in out and "GIS.Owners" in out,
+        check(code == 3 and "1 source(s)" in out and "GIS.Owners" in out,
               "--filter finds the server hidden behind a join  "
               "<-- pinned defect")
         bare = {"type": "CIMRelQueryTableDataConnection"}
@@ -2598,6 +2673,11 @@ def self_test():
               and "source repointed" not in out,
               "--diff with a third argument is a usage error  "
               "<-- pinned defect")
+        code, out = run(["--diff", joindir, joindir])
+        check(code == 64 and "is a folder" in out
+              and "no such document" not in out,
+              "--diff given two existing folders is a usage error, not a "
+              "missing path  <-- pinned defect")
 
         # ---- --diff does not call a damaged document clean
         stale = []
@@ -2720,7 +2800,7 @@ def self_test():
               "a layer the layers array does not list is still reported"
               "  <-- pinned defect")
         code, out = run([leftover_path, "--filter", "olddb"])
-        check(code == 0 and "Unlisted" in out and "1 source(s)" in out,
+        check(code == 3 and "Unlisted" in out and "1 source(s)" in out,
               "--filter finds the host behind an unlisted layer"
               "  <-- pinned defect")
 
@@ -2992,15 +3072,15 @@ def self_test():
               and split_doc.status == OK,
               "scan_document carries the findings on the layer that has them")
         code, out = run([split_path])
-        check(code == 0 and out.count("! split workspace:") == 2
+        check(code == 3 and out.count("! split workspace:") == 2
               and "split workspaces: 2 finding(s)" in out
               and "hunter2" not in out,
               "the text report prints each finding under its layer, no "
-              "secret, and exits 0")
+              "secret, and exits 3 because its sources are unknown")
         code, out = run([split_path, "--filter", "Mains"])
         check("split workspace" not in out,
               "--filter hides the findings of a layer it hides")
-        code, out = run([split_path, "--json"])
+        code, out, _err = capture([split_path, "--json"])
         payload = json.loads(out)["documents"][0]["sources"]
         check([len(s["split"]) for s in payload] == [2, 0]
               and "hunter2" not in out,
@@ -3070,14 +3150,14 @@ def self_test():
                 ("Hydrants", _fixture_fd(FIXTURE_SQL, "Hydrants", "Water")),
                 ("Mains", _fixture_fd(FIXTURE_SQL, "warehouse1.GIS.Mains",
                                       "warehouse1.GIS.Water"))]))
-        code, out = run([unq_path])
-        check(code == 0 and "split check: 1 feature dataset layer(s) had "
+        code, out, err = capture([unq_path])
+        check(code == 3 and "split check: 1 feature dataset layer(s) had "
               "unqualified or unequally qualified names and could not be "
               "compared" in out
               and "split workspace" not in out,
               "the text report counts the layers it could not compare, and "
-              "exits 0  <-- pinned defect")
-        payload = json.loads(run([unq_path, "--json"])[1])
+              "exits 3 because its sources are unknown  <-- pinned defect")
+        payload = json.loads(capture([unq_path, "--json"])[1])
         check(payload["split_unchecked_sources"] == 1
               and [s["splitUnchecked"] for s
                    in payload["documents"][0]["sources"]] == [True, False],
@@ -3085,9 +3165,10 @@ def self_test():
 
         # ---- unknown is counted, and a stat that fails is not MISSING
         check(payload["unknown_sources"] == 2 and payload["missing_sources"] == 0
-              and "2 unknown" in out.splitlines()[-1],
-              "the footer and --json count the unknown sources, which exit 0"
-              "  <-- pinned defect")
+              and "2 unknown" in out.splitlines()[-1]
+              and err.startswith("unknown: 2 source(s) are unknown"),
+              "the footer and --json count the unknown sources, and a scan "
+              "that could not tell exits 3 with no flag  <-- pinned defect")
         code, out = run([unq_path, "--strict"])
         check(code == 3 and "strict: 2 source(s) are MISSING or unknown" in out,
               "--strict turns unknown sources into exit 3  <-- pinned defect")
@@ -3101,6 +3182,15 @@ def self_test():
         check(run([present_path, "--strict"])[0] == 0
               and unverified_sources([scan_document(present_path)]) == 0,
               "--strict exits 0 when every source is present")
+        gone_path = os.path.join(workdir, "Gone.lyrx")
+        with open(gone_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx([
+                ("Dropped", _fixture_std("DATABASE=no-such.gdb", "x"))]))
+        code, out = run([gone_path])
+        check(code == 0 and "1 missing, 0 unknown" in out
+              and run([gone_path, "--strict"])[0] == 3,
+              "a MISSING source alone exits 0 and --strict makes it 3, "
+              "while an unknown source is 3 with no flag")
         check(run([os.path.join(workdir, "NoSuch.lyrx"), "--strict"])[0] == 2
               and run([unq_path, "--strict", "--json"])[0] == 3,
               "--strict keeps exit 2 for a missing path and works with --json")
@@ -3134,6 +3224,78 @@ def self_test():
               "defect")
         check(check_presence(workdir, False, lambda _p: None) is None,
               "check_presence passes an unknown stat on")
+
+        # ---- a UNC share spelled in the NT namespace is still a network path
+        nt_unc = (chr(92) + "??" + chr(92) + "UNC" + chr(92) + "nohost"
+                  + chr(92) + "share" + chr(92) + "x")
+        stats = []
+        spy = lambda path: stats.append(path)
+        check(is_network_path(nt_unc) and is_network_path(
+                  nt_unc.replace(chr(92), "/"))
+              and is_windows_absolute(nt_unc)
+              and not is_network_path(chr(92) + "??" + chr(92) + "C:"
+                                      + chr(92) + "x")
+              and is_network_path(chr(92) + "??" + chr(92) + "GLOBALROOT")
+              and resolve(nt_unc, workdir, isabs=lambda _p: True)
+              == resolve(nt_unc, workdir, isabs=lambda _p: False) == nt_unc,
+              "a path in the NT namespace is a network path, whatever "
+              "os.path.isabs says of it  <-- pinned defect")
+        check(check_presence(resolve(nt_unc, workdir, isabs=lambda _p: True),
+                             False, spy, windows=True) is None
+              and check_presence(nt_unc, False, spy, windows=False) is None
+              and stats == [],
+              "no stat goes out to a NT-namespace share without the flag  "
+              "<-- pinned defect")
+
+        # ---- a deleted shapefile leaves its folder behind
+        shpdir = os.path.join(workdir, "shp")
+        os.makedirs(os.path.join(shpdir, "data"))
+        for name in ("Roads.SHP", "parcels.dbf"):
+            with open(os.path.join(shpdir, "data", name), "w") as handle:
+                handle.write("x")
+        check(dataset_files("roads.shp", "FileGDB") == ("roads.shp",)
+              and dataset_files("roads", "Shapefile")
+              == ("roads.shp", "roads.dbf")
+              and dataset_files("roads", "FileGDB") == ()
+              and dataset_files("roads", 5) == ()
+              and dataset_files("sub/roads.shp", "Shapefile") == ()
+              and dataset_files("", "Shapefile") == (),
+              "a file dataset is named by its extension or by a Shapefile "
+              "workspace, and nothing else is asked about")
+        check(dataset_in_folder(frozenset(["a.shp"]), ("a.shp", "a.dbf"))
+              is True
+              and dataset_in_folder(frozenset(["b.shp"]), ("a.shp",))
+              is False
+              and dataset_in_folder(None, ("a.shp",)) is None
+              and read_folder(os.path.join(shpdir, "data"))
+              == frozenset(["roads.shp", "parcels.dbf"])
+              and read_folder(os.path.join(shpdir, "nope")) is None,
+              "the folder listing is lower-cased and an unreadable one is "
+              "unknown")
+        shp_path = os.path.join(shpdir, "Shp.lyrx")
+        shp_layers = []
+        for name, dataset, factory in (
+                ("Here", "roads.shp", "FileGDB"),
+                ("Gone", "roads2.shp", "FileGDB"),
+                ("Dbf", "parcels", "Shapefile"),
+                ("Lost", "lost", "Shapefile"),
+                ("Deep", "sub/x.shp", "Shapefile"),
+                ("Plain", "Parcels", "FileGDB")):
+            connection = _fixture_std("DATABASE=data", dataset)
+            connection["workspaceFactory"] = factory
+            shp_layers.append((name, connection))
+        with open(shp_path, "w") as handle:
+            handle.write(_fixture_layers_lyrx(shp_layers))
+        shp_states = dict((s.layer, s.state)
+                          for s in scan_document(shp_path).sources)
+        check(shp_states == {"Here": PRESENT, "Gone": MISSING, "Dbf": PRESENT,
+                             "Lost": MISSING, "Deep": PRESENT,
+                             "Plain": PRESENT},
+              "a shapefile deleted from a folder that is there is MISSING, "
+              "not present  <-- pinned defect")
+        code, out = run([shp_path])
+        check(code == 0 and "2 missing, 0 unknown" in out,
+              "and the scan counts both in the footer")
 
         # ---- a file geodatabase that is there but no longer lists the dataset
         def catalog(*names):
@@ -3256,9 +3418,8 @@ def _parse(argv):
                         help="authorise the one outbound action, the same as "
                              "--check-network. Nothing is ever written.")
     parser.add_argument("--strict", action="store_true",
-                        help="exit 3 when any shown source is MISSING or "
-                             "unknown, so a job cannot read exit 0 as 'the "
-                             "data is there'")
+                        help="also exit 3 when a shown source is MISSING. "
+                             "Without it, only an unknown source gives exit 3")
     parser.add_argument("--self-test", dest="self_test", action="store_true",
                         help="run the offline assertions and exit")
     return parser.parse_args(argv)
@@ -3266,6 +3427,10 @@ def _parse(argv):
 
 def _run_diff(args):
     for path in args.diff:
+        if os.path.isdir(path):
+            print("error: --diff takes documents, and %s is a folder" % path,
+                  file=sys.stderr)
+            return 64
         if not os.path.isfile(path):
             print("error: no such document: %s" % path, file=sys.stderr)
             return 2
@@ -3359,10 +3524,13 @@ def main(argv=None):
     # the documents inside it were never scanned and never counted.
     if unreadable or any(d.status == UNSUPPORTED for d in documents):
         return 1
-    unverified = unverified_sources(documents, args.filter)
-    if args.strict and unverified:
-        print("strict: %d source(s) are MISSING or unknown" % unverified,
-              file=sys.stderr)
+    states = (MISSING, UNKNOWN) if args.strict else (UNKNOWN,)
+    unverified = unverified_sources(documents, args.filter, states)
+    if unverified:
+        print("%s: %d source(s) are %s" % (
+            ("strict", unverified, "MISSING or unknown") if args.strict else
+            ("unknown", unverified, "unknown, so this run is not a clean one")),
+            file=sys.stderr)
         return 3
     return 0
 
