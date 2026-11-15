@@ -852,9 +852,6 @@ Two format facts cost more time than anything else here, and both are pinned by 
 - `--diff` prints `no semantic difference` for two layers whose data source the tool cannot see,
   such as a service URL held directly on the layer, because both sides give an empty source. The
   scan skips such a layer without a note.
-- A layer name, dataset or workspace that holds a newline or carriage return prints raw in the text
-  report, so a crafted document can forge a report line such as a fake `OK` row. Scan only
-  documents you trust, or use `--json`.
 - Opening a UNC or mapped-drive path that a document names makes Windows connect to that host and
   can send NTLM credentials. The mapped-drive probe, a stat of the drive root, runs even without
   `--check-network`, and a disconnected mapped drive can block for the SMB timeout.
