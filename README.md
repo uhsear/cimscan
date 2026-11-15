@@ -106,7 +106,7 @@ PASS  a dropped feature class in a geodatabase that is there is MISSING, one the
 PASS  datasets of one geodatabase with two verdicts are two plan rows  <-- pinned defect
 ...
 --------------------------------------------------------------------
-361 assertions, 0 failed
+363 assertions, 0 failed
 ```
 
 ## Requirements
@@ -700,9 +700,9 @@ Two format facts cost more time than anything else here, and both are pinned by 
   `SAS=` signature, print as stored. A `#` inside a token value ends the redacted value, so
   the text after it prints. A password that follows a line break in the connection string and holds
   `&` or `?` is redacted only up to that character.
-- The text report prints layer names, workspaces and notes as stored, so a hostile document can
-  forge report lines or send terminal escape codes. Use `--json`, which escapes them, or scan
-  trusted files.
+- The text report prints each control, bidi (U+202A-U+202E, U+2066-U+2069) and zero-width
+  (U+200B-U+200D, U+FEFF) character of a name as `?`, so a hostile document cannot forge report
+  lines or send terminal escape codes. `--json` keeps the characters, escaped.
 - Two layer parts that carry the same `uri` in one `.lyrx` overwrite each other, and the last one
   is read.
 - Several behaviours here have no vendor citation: that a scheduled task does not see a user's

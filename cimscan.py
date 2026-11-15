@@ -303,6 +303,17 @@ def _secret_name(key):
                for m in SECRET_KEY_MARKERS)
 
 
+# Names read from a scanned file reach a terminal in the text report. Control,
+# bidi and zero-width characters in them can rewrite or forge report lines.
+_UNPRINTABLE = re.compile(u"[\x00-\x1f\x7f-\x9f\u200b-\u200d\u202a-\u202e"
+                          u"\u2066-\u2069\ufeff]")
+
+
+def printable(text):
+    """Text for a terminal: each control, bidi or zero-width character is a ?."""
+    return _UNPRINTABLE.sub("?", "%s" % (text,))
+
+
 def redact(text):
     """Replace every secret-bearing value in a connection string.
 
@@ -1273,7 +1284,7 @@ def report_lines(documents, text_filter=None, unreadable=()):
                  "%d missing, %d unknown, %d unreadable directory(s)"
                  % (len(documents), len(documents) - unsupported, unsupported,
                     total, missing, unknown, len(unreadable)))
-    return lines
+    return [printable(line) for line in lines]
 
 
 def unverified_sources(documents, text_filter=None, states=(UNKNOWN,)):
@@ -1326,7 +1337,7 @@ def diff_lines(changes):
             lines.append("   after:  %s" % after)
     lines.append("")
     lines.append("%d change(s)" % len(changes))
-    return lines
+    return [printable(line) for line in lines]
 
 
 # ------------------------------------------------------------------ self-test
@@ -2400,6 +2411,17 @@ def self_test():
               "a document whose every source the filter rejected stays quiet")
         check("Notes.lyrx" in out,
               "an UNSUPPORTED document is printed whatever the filter says")
+        hostile = "ok\x1b[2K\rFAKE\u202e\u200b\u2066\ufeff"
+        trap = os.path.join(workdir, "hostile")
+        os.mkdir(trap)
+        handle = open(os.path.join(trap, "H.lyrx"), "w")
+        handle.write(_fixture_lyrx("DS" + hostile, None, "F", name=hostile))
+        handle.close()
+        code, out = run([trap])
+        check("ok?[2K?FAKE????" in out
+              and not _UNPRINTABLE.search(out.replace("\n", "")),
+              "a name with escape, bidi and zero-width characters prints "
+              "with each one replaced  <-- pinned defect")
         code, out = run([home, "--json", "--filter", "GIS.Owners"])
         payload = json.loads(out)
         check(payload["root"] == home, "--json names the root it scanned")
@@ -3527,17 +3549,20 @@ def _parse(argv):
 def _run_diff(args):
     for path in args.diff:
         if os.path.isdir(path):
-            print("error: --diff takes documents, and %s is a folder" % path,
+            print("error: --diff takes documents, and %s is a folder"
+                  % printable(path),
                   file=sys.stderr)
             return 64
         if not os.path.isfile(path):
-            print("error: no such document: %s" % path, file=sys.stderr)
+            print("error: no such document: %s" % printable(path),
+                  file=sys.stderr)
             return 2
     documents = []
     for path in args.diff:
         named = not_cim_note(path)
         if named:
-            print("error: %s is %s: %s" % (path, UNSUPPORTED, named),
+            print("error: %s is %s: %s" % (printable(path), UNSUPPORTED,
+                                             printable(named)),
                   file=sys.stderr)
             return 1
         try:
@@ -3550,7 +3575,8 @@ def _run_diff(args):
                 raise ValueError("the root object is not a CIM document")
             documents.append(root)
         except Exception as exc:
-            print("error: %s is %s: %s" % (path, UNSUPPORTED, exc),
+            print("error: %s is %s: %s" % (printable(path), UNSUPPORTED,
+                                             printable(exc)),
                   file=sys.stderr)
             return 1
     dangling = []
@@ -3566,7 +3592,8 @@ def _run_diff(args):
         # A damaged document hides layers, so no answer above is a clean one.
         for reference in sorted(set(dangling)):
             print("error: %s: a layer reference names no part of the "
-                  "document: %s" % (UNSUPPORTED, reference), file=sys.stderr)
+                  "document: %s" % (UNSUPPORTED, printable(reference)),
+                  file=sys.stderr)
         return 1
     return 0
 
@@ -3597,14 +3624,16 @@ def main(argv=None):
               "verify the tool without any ArcGIS data.", file=sys.stderr)
         return 64
     if not os.path.exists(args.root):
-        print("error: no such path: %s" % args.root, file=sys.stderr)
+        print("error: no such path: %s" % printable(args.root),
+              file=sys.stderr)
         return 2
 
     unreadable = []
     paths = find_documents(args.root, unreadable)
     # --json always prints JSON, so a consumer never meets a sentence.
     if not paths and not unreadable and not args.json:
-        print("no .aprx, .lyrx, .mapx or .pagx documents under %s" % args.root)
+        print("no .aprx, .lyrx, .mapx or .pagx documents under %s"
+              % printable(args.root))
         return 0
 
     check_network = args.check_network or args.apply
